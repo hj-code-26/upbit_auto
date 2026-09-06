@@ -1,0 +1,9 @@
+﻿pyupbit
+pandas
+numpy
+scikit-learn
+anthropic
+requests
+python-dotenv
+fastapi
+uvicorn
