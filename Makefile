@@ -4,7 +4,7 @@ SHELL := powershell.exe
 PORT ?= 8000
 PY ?= python
 
-.PHONY: run stop omni on off once test keys liquidate reset minutes entry sweep quant both downside rev lat bias current sexit flow learn
+.PHONY: run stop omni on off once test offline audit sizing keys liquidate reset minutes entry sweep quant both downside rev lat bias current sexit flow learn
 
 run: stop omni
 	@$(PY) dashboard.py
@@ -26,6 +26,16 @@ once:
 
 test:
 	@$(PY) okx.py; $(PY) test_bot.py; $(PY) test_leverage.py; $(PY) model.py; $(PY) minute_data.py
+
+offline:                                # 거래소 없이 도는 점검만 (엔진·신호·시간축·상태기계)
+	@$(PY) engine.py; $(PY) model.py; $(PY) indicators.py; $(PY) test_signal.py; $(PY) test_bot.py
+
+# ---- 2026-09-10 감사 (audit/AUDIT.md) ----
+audit:                                  # 3단계 성적 비교 CSV + 거래 원장 (원본 / 엔진수정 / 전략변경)
+	@$(PY) audit/manifest.py | Out-Null; $(PY) audit/compare.py
+
+sizing:                                 # 사이징 후보 · 지표 중복 ablation · 스트레스 · bootstrap
+	@$(PY) backtest_sizing.py --boot
 
 # ---- 진입 타이밍 연구 (research_entry_timing.txt) ----
 entry:                                  # 진입 정책 비교. 첫 실행은 이벤트 구간 분봉을 받는다 (약 1분)
