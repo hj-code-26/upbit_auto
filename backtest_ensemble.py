@@ -223,4 +223,5 @@ def main():
 
 
 if __name__ == "__main__":
+    sys.stdout.reconfigure(encoding="utf-8")   # 콘솔 기본 cp949 에서 ═·─ 가 깨진다
     main()
