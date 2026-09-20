@@ -4,7 +4,7 @@ SHELL := powershell.exe
 PORT ?= 8000
 PY ?= python
 
-.PHONY: vt vtwf ensemble run bot view botstop multi stop omni on off once test offline audit sizing keys liquidate reset minutes entry sweep quant both downside rev lat bias current sexit flow learn
+.PHONY: funding hour vt vtwf ensemble run bot view botstop multi stop omni on off once test offline audit sizing keys liquidate reset minutes entry sweep quant both downside rev lat bias current sexit flow learn
 
 run: stop omni
 	@$(PY) dashboard.py
@@ -82,6 +82,9 @@ current:                                # 지금 .env 설정 그대로의 수익
 
 sexit:                                  # 숏 청산을 다른 축(시간·ATR·익절)으로 재설계 (결론: 28조합 전부 음수)
 	@$(PY) backtest_shortexit.py
+
+funding:                                # 펀딩 z-score 게이트 (결론: 조건부 정보량은 있으나 MDD 를 못 줄임, REJECT)
+	@$(PY) backtest_funding.py
 
 vt:                                     # 변동성 타겟팅 재측정 (상한 5배). 결론: 사전등록 좌표 REJECT, 창 선택은 vtwf
 	@$(PY) backtest_vt.py

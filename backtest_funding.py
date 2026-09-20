@@ -49,3 +49,161 @@
 사용: python backtest_funding.py   (make funding)
 결과: research_funding.txt
 """
+import sys
+import time
+
+import ccxt
+import numpy as np
+import pandas as pd
+
+from isolation import guard
+
+guard()
+
+import backtest_quant as Q                                          # noqa: E402
+import backtest_vt as V                                             # noqa: E402
+import model as M                                                   # noqa: E402
+
+NL = chr(10)
+CAP = V.CAP                      # .env LEVERAGE=5
+Z, WIN = 2.0, 60                 # 주 설정 (사전등록)
+GRID_Z, GRID_WIN = (1.0, 1.5, 2.0, 2.5, 3.0), (30, 60, 90)
+START, SPLIT = Q.START, Q.SPLIT
+
+
+def funding():
+    """바이낸스 USDT-M BTCUSDT 실측 펀딩 이력 (8h). 캐시. → Series[시각] = 펀딩률."""
+    f = M.CACHE / "binance_funding.pkl"
+    if f.exists():
+        return pd.read_pickle(f)
+    M.CACHE.mkdir(exist_ok=True)
+    ex = ccxt.binance({"enableRateLimit": True, "options": {"defaultType": "future"}})
+    rows, since = [], ex.parse8601("2019-09-08T00:00:00Z")
+    while since < ex.milliseconds():
+        r = ex.fapiPublicGetFundingRate({"symbol": "BTCUSDT", "startTime": since, "limit": 1000})
+        if not r:
+            break
+        rows += r
+        nxt = int(r[-1]["fundingTime"]) + 1
+        if nxt <= since:
+            break
+        since = nxt
+        time.sleep(0.05)
+    s = pd.Series({pd.to_datetime(int(x["fundingTime"]), unit="ms", utc=True): float(x["fundingRate"])
+                   for x in rows}).sort_index()
+    s = s[~s.index.duplicated()]
+    s.to_pickle(f)
+    return s
+
+
+def zscore(fund, h4_index, win_d):
+    """4h 봉마다 '그 봉이 닫히는 시각까지 확정된' 펀딩으로 만든 z. 미래 값이 섞이지 않는다.
+
+    펀딩은 8h 간격이라 4h 봉 두 개당 한 번 갱신된다. 봉 종료 시각 **이하** 의 마지막 펀딩만 쓴다."""
+    end = h4_index + pd.Timedelta(hours=4)
+    n = win_d * 3                                   # 하루 3회
+    mu = fund.rolling(n, min_periods=n // 2).mean()
+    sd = fund.rolling(n, min_periods=n // 2).std(ddof=1)
+    z = ((fund - mu) / sd.replace(0, np.nan))
+    out = z.reindex(z.index.union(end)).sort_index().ffill().reindex(end)
+    out.index = h4_index
+    return out.values
+
+
+def run(h4, en, ex, fills, z, thr, mode):
+    """mode='base' 기준선 · 'G' 게이트(포기) · 'L' 레버리지 절반."""
+    hot = np.isfinite(z) & (z > thr)
+    if mode == "G":
+        return Q.simulate(h4, en & ~hot, ex, lambda i, c: CAP, fills=fills)
+    if mode == "L":
+        return Q.simulate(h4, en, ex, lambda i, c: CAP / 2 if hot[i - 1] else CAP, fills=fills)
+    return Q.simulate(h4, en, ex, lambda i, c: CAP, fills=fills)
+
+
+def main():
+    h4, entry, exit_, _, _ = Q.frames()
+    m = h4.index >= pd.Timestamp(START, tz="UTC")
+    h4, entry, exit_ = h4[m], entry[m], exit_[m]
+    fl = Q.reclaim_fills()
+    fund = funding()
+    print(f"바이낸스 BTCUSDT 펀딩 {fund.index[0]:%Y-%m-%d}~{fund.index[-1]:%Y-%m-%d} · {len(fund):,}회 "
+          f"· 평균 {fund.mean()*100:+.4f}%/8h (연율 {fund.mean()*3*365*100:+.1f}%) · 양수 {(fund>0).mean()*100:.0f}%")
+    z = zscore(fund, h4.index, WIN)
+
+    # (b)(c) 미래 누설 점검: 봉 종료 이후의 펀딩이 섞이면 이 값이 달라진다
+    probe = h4.index[len(h4) // 2]
+    last_ok = fund[fund.index <= probe + pd.Timedelta(hours=4)].index[-1]
+    assert last_ok <= probe + pd.Timedelta(hours=4), "(b) 봉 종료 이후 펀딩을 썼다"
+    z_trunc = zscore(fund[fund.index <= probe + pd.Timedelta(hours=4)], h4.index[:len(h4) // 2 + 1], WIN)
+    assert np.allclose(z_trunc[~np.isnan(z_trunc)], z[:len(h4) // 2 + 1][~np.isnan(z_trunc)], equal_nan=True),         "(c) 미래 표본을 잘라내면 z 가 달라진다 = 누설"
+
+    base = run(h4, entry, exit_, fl, z, Z, "base")
+    inf_ = run(h4, entry, exit_, fl, z, 1e9, "G")
+    assert abs(inf_[0].iloc[-1] - base[0].iloc[-1]) < 1e-9, "(a) Z=무한대 != 고정 5배"
+    print("ok  불변식 (a) Z=무한 = 고정 5배 · (b) 봉 종료 이후 펀딩 미사용 · (c) 표본 절단에도 z 동일")
+
+    # ── 조건부 정보량: 우리 진입 자리에서 몇 번 켜지는가 (판정보다 먼저) ──
+    ent_i = [i for i in range(1, len(h4)) if entry[i - 1]]
+    zi = np.array([z[i - 1] for i in ent_i])
+    zi = zi[np.isfinite(zi)]
+    print(f"{NL}── 조건부 정보량 (판정 전에 먼저 본다) ──")
+    print(f"   진입 신호 {len(ent_i)}건 중 z 가 유효한 {len(zi)}건")
+    print(f"   전체 봉의 z 분포: >1.0 {np.nanmean(z>1)*100:.1f}% · >2.0 {np.nanmean(z>2)*100:.1f}% · >3.0 {np.nanmean(z>3)*100:.1f}%")
+    for t in GRID_Z:
+        print(f"   진입 자리에서 z>{t}: {int((zi>t).sum()):3d}건 ({(zi>t).mean()*100:5.1f}%)  "
+              f"[전체 봉 {np.nanmean(z>t)*100:5.1f}%]")
+    fires = int((zi > Z).sum())
+
+    print(f"{NL}{'':24s}{'──── 탐색 ────':>22} |{'──── 검증 ────':>22} |{'────── 전체 ──────':>28}"
+          f"{'거래':>5}{'승률':>6}{'최악':>7}{'청산':>4}")
+    print(f"{'':24s}{'CAGR':>7}{'MDD':>7}{'Sh':>6} |{'CAGR':>7}{'MDD':>7}{'Sh':>6} |"
+          f"{'누적':>9}{'MDD':>7}{'Sh':>6}")
+    rep = lambda n, r: Q.report(n, *r)
+    f = lambda r, lo, hi: Q.metrics(r[0], r[1], r[2], lo, hi)
+
+    print(f"{NL}── 기준선 ──")
+    rep(f"고정 {CAP:.0f}배 (지금 라이브)", base)
+    print(f"{NL}── 주 설정 Z={Z} · 창 {WIN}일 ──")
+    cands = {}
+    for mode, nm in (("G", "G 게이트(포기)"), ("L", "L 레버리지 절반")):
+        cands[mode] = run(h4, entry, exit_, fl, z, Z, mode)
+        rep(nm, cands[mode])
+
+    bv = f(base, SPLIT, None)["sharpe"]
+    hits = {"G": 0, "L": 0}
+    print(f"{NL}── 격자 Z × 창 ──")
+    for win in GRID_WIN:
+        zz = zscore(fund, h4.index, win)
+        for t in GRID_Z:
+            for mode in ("G", "L"):
+                r = run(h4, entry, exit_, fl, zz, t, mode)
+                hits[mode] += f(r, SPLIT, None)["sharpe"] > bv
+                rep(f"{mode} Z={t}·창{win}일", r)
+        print()
+
+    bt, bvm, bf = f(base, START, SPLIT), f(base, SPLIT, None), f(base, START, None)
+    tb = V.tail(base[1])
+    print(f"{NL}═══ 사전 등록 판정 ═══")
+    if fires <= 2:
+        print(f"  발동 {fires}건 → **INCONCLUSIVE**. 사전등록대로 격자 결과와 무관하게 판정 불가로 적는다.")
+        print("  '발동이 적어 성적이 같다' 는 '해롭지 않다' 가 아니다 (research_flow.txt 의 TBR 전례).")
+    for mode, nm in (("G", "G 게이트"), ("L", "L 레버리지")):
+        c = cands[mode]
+        ct, cv, cf = f(c, START, SPLIT), f(c, SPLIT, None), f(c, START, None)
+        rate = hits[mode] / (len(GRID_Z) * len(GRID_WIN)) * 100
+        tc = V.tail(c[1])
+        checks = [("(1) 검증 Sharpe >", cv["sharpe"] > bvm["sharpe"], f"{cv['sharpe']:.2f} vs {bvm['sharpe']:.2f}"),
+                  ("(2) 탐색 Sharpe >=", ct["sharpe"] >= bt["sharpe"], f"{ct['sharpe']:.2f} vs {bt['sharpe']:.2f}"),
+                  ("(3) 전체 MDD 개선", cf["mdd"] > bf["mdd"], f"{cf['mdd']:.1f}% vs {bf['mdd']:.1f}%"),
+                  ("(4) 격자 >=70%", rate >= 70, f"{rate:.0f}%"),
+                  ("(5) 청산 <=", c[2]["liq"] <= base[2]["liq"], f"{c[2]['liq']} vs {base[2]['liq']}"),
+                  ("(6) 상위5 제외 누적", tc > tb, f"{tc:+.0f}% vs {tb:+.0f}%")]
+        ok = all(v for _, v, _ in checks)
+        print(f"{NL}  [{nm}] " + " · ".join(f"{n.split(')')[0]}) {'O' if v else 'X'}({d})" for n, v, d in checks))
+        print(f"    → {'ADOPT' if ok and fires > 2 else ('INCONCLUSIVE' if fires <= 2 else 'REJECT')}")
+    print(f"{NL}  시도 수 N = 30 (사전등록과 같음).")
+
+
+if __name__ == "__main__":
+    sys.stdout.reconfigure(encoding="utf-8")
+    main()
