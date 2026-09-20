@@ -83,6 +83,9 @@ current:                                # 지금 .env 설정 그대로의 수익
 sexit:                                  # 숏 청산을 다른 축(시간·ATR·익절)으로 재설계 (결론: 28조합 전부 음수)
 	@$(PY) backtest_shortexit.py
 
+hour:                                   # 시간대·요일 필터 + 순열검정 (결론: p=0.27/0.45, REJECT)
+	@$(PY) backtest_hour.py
+
 funding:                                # 펀딩 z-score 게이트 (결론: 조건부 정보량은 있으나 MDD 를 못 줄임, REJECT)
 	@$(PY) backtest_funding.py
 
