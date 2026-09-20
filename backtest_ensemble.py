@@ -51,4 +51,176 @@
 사용: python backtest_ensemble.py   (make ensemble)
 결과: research_ensemble.txt
 """
-raise SystemExit("사전등록만 커밋됨 — 구현은 다음 커밋")
+import sys
+
+import numpy as np
+import pandas as pd
+
+from isolation import guard
+
+guard()
+
+import backtest_okx as B                                            # noqa: E402
+import backtest_quant as Q                                          # noqa: E402
+import engine as E                                                  # noqa: E402
+import model as M                                                   # noqa: E402
+
+SETS = [(6, 3), (12, 6), (30, 15)]                  # 사전등록한 룩백 3세트 (research_okx_short.txt 에서 물려받음)
+GRIDS = [[(5, 2), (10, 5), (24, 12)], [(8, 4), (16, 8), (40, 20)]]   # ④ 이웃 격자
+SINGLE = (M.H4_N, M.H4_M)                           # 기준선 = 지금 봇 (12, 6)
+START, SPLIT = Q.START, Q.SPLIT
+
+
+def frames():
+    """4h 봉 + 일봉 국면. 룩백마다 다른 것은 돌파선/이탈선뿐이라 여기서는 국면만 만든다."""
+    d1, h4 = B.fetch("1d"), B.fetch("4h")
+    rg = M.align_daily(B.bull(d1) >= M.CONF, h4.index).fillna(False).astype(bool)
+    m = h4.index >= pd.Timestamp(START, tz="UTC")
+    return h4[m], rg.values[m]
+
+
+def sig(h4, rg, n, m):
+    """룩백 (n, m) 의 (진입, 청산) 신호. 지금 봇 규칙을 기간만 바꾼 것이다."""
+    hi = h4.high.rolling(n).max().shift(1)
+    lo = h4.low.rolling(m).min().shift(1)
+    return ((h4.close > hi) & rg).values, ((h4.close < lo) | ~rg).values
+
+
+def hold_state(en, ex):
+    """진입 신호 뒤 청산 신호까지 '보유 중' 인 구간. engine 과 같은 순서(청산 먼저)로 재현한다."""
+    out = np.zeros(len(en), bool)
+    on = False
+    for i in range(len(en)):
+        if on and ex[i]:
+            on = False
+        elif not on and en[i]:
+            on = True
+        out[i] = on
+    return out
+
+
+def sleeves(h4, rg, sets, lev):
+    """A) 슬리브 분할 — 각 룩백을 자본 1/3 의 **독립 계좌**로 굴리고 곡선을 더한다.
+
+    슬리브끼리 리밸런싱하지 않는다 (각자 자기 몫만 복리). 따라서 한 슬리브가 청산돼도
+    잃는 것은 전체의 1/3 이다 — 불변식 (c). 전부 같은 룩백이면 단일과 완전히 같다 — 불변식 (a)."""
+    w = 1.0 / len(sets)
+    curves, trades, liq, amb, open_end = [], [], 0, 0, False
+    for n, m in sets:
+        en, ex = sig(h4, rg, n, m)
+        c, t, st = E.run(h4, en, ex, np.zeros(len(h4), bool), np.zeros(len(h4), bool),
+                         lambda i, cv: lev, allow=("long",))
+        curves.append(c * w)
+        trades.append(t)
+        liq += st["liq"]; amb += st["liq_ambiguous"]; open_end |= st["open_at_end"]
+    tr = pd.concat(trades, ignore_index=True) if any(len(t) for t in trades) else trades[0]
+    return sum(curves), tr, {"liq": liq, "liq_ambiguous": amb, "open_at_end": open_end}
+
+
+def combo(h4, rg, sets, lev, kmin=1, scale=True):
+    """B) 신호 합산 — 단일 포지션. 켜진 슬리브 수 k 에 비례해 레버리지 lev×k/len(sets).
+
+    레버리지는 **진입 시점 k 로 정하고 그 거래 동안 고정**한다 (거래소가 포지션 단위로 건다).
+    kmin=1 · scale=False 면 '셋 중 하나라도 켜지면 진입' 과 같다 — 불변식 (b)."""
+    k = sum(hold_state(*sig(h4, rg, n, m)).astype(int) for n, m in sets)
+    en, ex = k >= kmin, k == 0
+    lv = (lambda i, cv: lev * k[i - 1] / len(sets)) if scale else (lambda i, cv: lev)
+    c, t, st = E.run(h4, en, ex, np.zeros(len(h4), bool), np.zeros(len(h4), bool), lv, allow=("long",))
+    return c, t, st
+
+
+def single(h4, rg, lev):
+    en, ex = sig(h4, rg, *SINGLE)
+    return E.run(h4, en, ex, np.zeros(len(h4), bool), np.zeros(len(h4), bool),
+                 lambda i, cv: lev, allow=("long",))
+
+
+def judge(name, base, cand):
+    """사전등록 ①~⑤. base/cand = (곡선, 거래, stats). → (통과여부, 사유 문자열)"""
+    f = lambda r, lo, hi: Q.metrics(r[0], r[1].ret.values if len(r[1]) else np.zeros(1), r[2], lo, hi)
+    bt, bv, bf = f(base, START, SPLIT), f(base, SPLIT, None), f(base, START, None)
+    ct, cv, cf = f(cand, START, SPLIT), f(cand, SPLIT, None), f(cand, START, None)
+    checks = [("① 검증 Sharpe >", cv["sharpe"] > bv["sharpe"], f"{cv['sharpe']:.2f} vs {bv['sharpe']:.2f}"),
+              ("② 탐색 Sharpe ≥", ct["sharpe"] >= bt["sharpe"], f"{ct['sharpe']:.2f} vs {bt['sharpe']:.2f}"),
+              ("③ 전체 MDD 개선", cf["mdd"] > bf["mdd"], f"{cf['mdd']:.1f}% vs {bf['mdd']:.1f}%"),
+              ("⑤ 청산 ≤", cand[2]["liq"] <= base[2]["liq"], f"{cand[2]['liq']} vs {base[2]['liq']}")]
+    ok = all(c[1] for c in checks)
+    print(f"  {name:28s} " + " · ".join(f"{n} {'O' if v else 'X'}({d})" for n, v, d in checks)
+          + f"  → {'PASS' if ok else 'FAIL'}")
+    return ok
+
+
+def _selfcheck(h4, rg):
+    """사전등록 불변식 (a)(b)(c). 통과 못 하면 아래 표를 믿지 않는다."""
+    a = sleeves(h4, rg, [SINGLE] * 3, 3)
+    b = single(h4, rg, 3)
+    assert np.allclose(a[0].values, b[0].values), "(a) 같은 룩백 3슬리브 ≠ 단일"
+    c1 = combo(h4, rg, SETS, 3, kmin=1, scale=False)
+    k = sum(hold_state(*sig(h4, rg, n, m)).astype(int) for n, m in SETS)
+    o_en, o_ex = k >= 1, k == 0
+    c2 = E.run(h4, o_en, o_ex, np.zeros(len(h4), bool), np.zeros(len(h4), bool),
+               lambda i, cv: 3, allow=("long",))
+    assert np.allclose(c1[0].values, c2[0].values), "(b) k≥1 고정배율 ≠ OR 진입"
+    d = sleeves(h4, rg, SETS, 5)
+    step = (d[0] / d[0].shift(1)).dropna().min()
+    assert step > 1 / 3 - 1e-9, f"(c) 한 봉에 1/3 초과 손실: {step}"
+    print("ok  불변식 (a) 같은룩백=단일 · (b) k≥1=OR · (c) 슬리브 손실 ≤ 1/3")
+
+
+def main():
+    h4, rg = frames()
+    print(f"OKX BTC 4h {h4.index[0]:%Y-%m-%d}~{h4.index[-1]:%Y-%m-%d} · CONF={M.CONF} · 편도 {Q.COST * 100:.2f}%"
+          f" · 진입 4h 시가 시장가(분봉 재확보 없음)")
+    print(f"룩백 {SETS} · 탐색 {START}~{SPLIT} / 검증 {SPLIT}~")
+    _selfcheck(h4, rg)
+    print(f"\n{'':24s}{'──── 탐색 ────':>22} |{'──── 검증 ────':>22} |{'────── 전체 ──────':>28}"
+          f"{'거래':>5}{'승률':>6}{'최악':>7}{'청산':>4}")
+    print(f"{'':24s}{'CAGR':>7}{'MDD':>7}{'Sh':>6} |{'CAGR':>7}{'MDD':>7}{'Sh':>6} |"
+          f"{'누적':>9}{'MDD':>7}{'Sh':>6}")
+
+    rep = lambda name, r: Q.report(name, r[0], r[1].ret.values if len(r[1]) else np.zeros(1), r[2])
+    base = {}
+    print("\n── 기준선: 단일 12/6 (지금 봇) ──")
+    for lev in (1, 3, 5):
+        base[lev] = single(h4, rg, lev)
+        rep(f"단일 12/6 {lev}배", base[lev])
+
+    print("\n── A) 슬리브 분할 (각 1/3, 독립 계좌, 리밸런싱 없음) ──")
+    A = {lev: sleeves(h4, rg, SETS, lev) for lev in (1, 3, 5)}
+    for lev in (1, 3, 5):
+        rep(f"A 슬리브 {lev}배", A[lev])
+
+    print("\n── B) 신호 합산 (단일 포지션, 레버리지 ×k/3, 진입 시점 고정) ──")
+    Bv = {lev: combo(h4, rg, SETS, lev) for lev in (1, 3, 5)}
+    for lev in (1, 3, 5):
+        rep(f"B 합산 {lev}배", Bv[lev])
+    rep("B 대조 k≥1 고정 3배", combo(h4, rg, SETS, 3, kmin=1, scale=False))
+
+    print("\n── ④ 이웃 룩백 격자 (5배) ──")
+    G = []
+    for g in GRIDS:
+        ga, gb = sleeves(h4, rg, g, 5), combo(h4, rg, g, 5)
+        rep(f"A {g[0]}..{g[-1]}", ga)
+        rep(f"B {g[0]}..{g[-1]}", gb)
+        G.append((ga, gb))
+
+    print("\n═══ 사전 등록 판정 (기준선 = 단일 12/6 5배, 라이브 설정) ═══")
+    pa = judge("A 슬리브 5배", base[5], A[5])
+    pb = judge("B 합산 5배", base[5], Bv[5])
+    print("  ④ 이웃 격자:")
+    ga = all([judge(f"   A {g[0]}..{g[-1]}", base[5], x[0]) for g, x in zip(GRIDS, G)])
+    gb = all([judge(f"   B {g[0]}..{g[-1]}", base[5], x[1]) for g, x in zip(GRIDS, G)])
+    print(f"\n  A) {'ADOPT 후보' if pa and ga else 'REJECT'}   B) {'ADOPT 후보' if pb and gb else 'REJECT'}")
+    print("\n── 사후분석 (판정 이후. 왜 졌는지만 본다 — 이 표로 새 규칙을 고르지 않는다) ──")
+    for n, m in SETS:
+        en, ex = sig(h4, rg, n, m)
+        for lev in (1, 3, 5):
+            rep(f"  ({n},{m}) 단독 {lev}배",
+                E.run(h4, en, ex, np.zeros(len(h4), bool), np.zeros(len(h4), bool),
+                      lambda i, cv, L=lev: L, allow=("long",)))
+    print("  ⑥ 대체 판정은 ADOPT 후보가 나온 뒤 분봉 재확보 경로에서 다시 잰다 (사전등록 참조).")
+    print("  참고: 3배·1배 표는 맥락용이다. 판정은 라이브 설정인 5배에서만 한다.")
+
+
+if __name__ == "__main__":
+    main()

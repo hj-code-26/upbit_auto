@@ -4,10 +4,25 @@ SHELL := powershell.exe
 PORT ?= 8000
 PY ?= python
 
-.PHONY: run stop omni on off once test offline audit sizing keys liquidate reset minutes entry sweep quant both downside rev lat bias current sexit flow learn
+.PHONY: ensemble run bot view botstop multi stop omni on off once test offline audit sizing keys liquidate reset minutes entry sweep quant both downside rev lat bias current sexit flow learn
 
 run: stop omni
 	@$(PY) dashboard.py
+
+bot: omni                               # 터미널 봇: 대시보드 없이 INTERVAL_MIN 분마다 판단·주문 (Ctrl+C 로 종료)
+	@$(PY) autotrade.py
+
+view: stop                              # 보기 전용 대시보드 — make bot 이 떠 있으면 판단·주문 버튼이 잠긴다
+	@$(PY) dashboard.py
+
+botstop:                                # 주문 락(127.0.0.1:8765)을 잡은 프로세스 = 돌고 있는 봇을 끈다
+	@Get-NetTCPConnection -LocalPort 8765 -State Bound -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "kill bot: PID $$($$_.OwningProcess)"; Stop-Process -Id $$_.OwningProcess -Force -ErrorAction SilentlyContinue }; exit 0
+
+soxl:                                   # quant_nasq100 SOXL 규칙(밴드 리밸런싱+폭락 게이트) 코인 이식 검증. 결론: REJECT
+	@$(PY) backtest_soxl.py
+
+multi:                                  # 거래량 상위 10코인 포트폴리오 (첫 실행은 --fetch 먼저). 결론: DOGE 의존이라 기각
+	@$(PY) backtest_multi.py
 
 omni:                                   # OmniRoute(Claude 게이트웨이) 가 안 떠 있으면 백그라운드로 띄운다
 	@if (-not (Get-NetTCPConnection -LocalPort 20128 -State Listen -ErrorAction SilentlyContinue)) { omniroute serve --daemon --no-open | Out-Null; Write-Host "omniroute 시작 (http://localhost:20128)" }; exit 0
@@ -67,6 +82,9 @@ current:                                # 지금 .env 설정 그대로의 수익
 
 sexit:                                  # 숏 청산을 다른 축(시간·ATR·익절)으로 재설계 (결론: 28조합 전부 음수)
 	@$(PY) backtest_shortexit.py
+
+ensemble:                               # 다중 룩백 앙상블 (6,3)(12,6)(30,15) 사전등록 검증 (결론: REJECT)
+	@$(PY) backtest_ensemble.py
 
 flow:                                   # 매수/매도 흐름의 반복 패턴 (바이낸스 taker 7년. 결론: 관성이지 반전 아님)
 	@$(PY) backtest_flow.py
