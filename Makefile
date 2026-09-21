@@ -4,7 +4,7 @@ SHELL := powershell.exe
 PORT ?= 8000
 PY ?= python
 
-.PHONY: oi funding hour vt vtwf ensemble run bot view botstop multi stop omni on off once test offline audit sizing keys liquidate reset minutes entry sweep quant both downside rev lat bias current sexit flow learn
+.PHONY: lev oi funding hour vt vtwf ensemble run bot view botstop multi stop omni on off once test offline audit sizing keys liquidate reset minutes entry sweep quant both downside rev lat bias current sexit flow learn
 
 run: stop omni
 	@$(PY) dashboard.py
@@ -82,6 +82,9 @@ current:                                # 지금 .env 설정 그대로의 수익
 
 sexit:                                  # 숏 청산을 다른 축(시간·ATR·익절)으로 재설계 (결론: 28조합 전부 음수)
 	@$(PY) backtest_shortexit.py
+
+lev:                                    # 레버리지 다이얼 — 고정 1/2/3/5배 + 꼬리위험 + 실계좌 사이징 제약
+	@$(PY) backtest_lev.py
 
 oi:                                     # 미결제약정 적재 (백테스트는 데이터가 2년 쌓인 뒤에)
 	@$(PY) oi_log.py
