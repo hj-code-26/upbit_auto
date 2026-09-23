@@ -4,7 +4,7 @@ SHELL := powershell.exe
 PORT ?= 8000
 PY ?= python
 
-.PHONY: longtrend lev oi funding hour vt vtwf ensemble run bot view botstop multi stop omni on off once test offline audit sizing keys liquidate reset minutes entry sweep quant both downside rev lat bias current sexit flow learn
+.PHONY: exitconf decomp longtrend lev oi funding hour vt vtwf ensemble run bot view botstop multi stop omni on off once test offline audit sizing keys liquidate reset minutes entry sweep quant both downside rev lat bias current sexit flow learn
 
 run: stop omni
 	@$(PY) dashboard.py
@@ -82,6 +82,12 @@ current:                                # 지금 .env 설정 그대로의 수익
 
 sexit:                                  # 숏 청산을 다른 축(시간·ATR·익절)으로 재설계 (결론: 28조합 전부 음수)
 	@$(PY) backtest_shortexit.py
+
+exitconf:                               # 청산 문턱 분리 (진입 CONF / 청산 CONF-BUF). 결론: ADOPT
+	@$(PY) backtest_exitconf.py
+
+decomp:                                 # 히스테리시스 원인 분해 (진입 쪽 vs 청산 쪽)
+	@$(PY) backtest_longtrend.py --decomp
 
 longtrend:                              # quant_nasq100 2차 이식 — 장기추세 필터(기각) + 국면 히스테리시스(채택)
 	@$(PY) backtest_longtrend.py

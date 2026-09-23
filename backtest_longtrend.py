@@ -260,7 +260,8 @@ def main():
     M.CONF = keep
 
     # ── 독립 표본: Bitstamp BTC/USD 2016~ (우리 표본은 2021-03~. 2016~2021 은 완전히 새 데이터다) ──
-    print(f"{NL}   (3) 독립 표본 — Bitstamp BTC/USD 4h 2016~ · 1배(현물 가정) · 편도 0.10%")
+    print(f"{NL}   (3) 독립 표본 — Bitstamp BTC/USD 4h 2016~ · 1배 · 편도 {E.cost()*100:.2f}%"
+          f" (engine.cost() 하나를 기준선·후보에 같이 적용한다)")
     print("       이게 갈라준다. CONF 축에서 뒤집힌 것이 표본 운인지 진짜 한계인지.")
     import backtest_reversion as RV
     b4, b1 = RV.fetch("bitstamp", "4h"), RV.fetch("bitstamp", "1d")
@@ -293,6 +294,89 @@ def main():
         print()
 
 
+def decomp():
+    """히스테리시스 효과가 진입 쪽인가 청산 쪽인가 — 2x2 분해 (2026-09-23).
+
+    국면은 두 군데에 들어간다:  진입 = 국면 & 돌파   ·   청산 = 이탈 | 국면 붕괴
+    한쪽씩만 히스테리시스로 바꿔 어느 쪽이 이득을 만드는지 가른다.
+    이건 새 후보 탐색이 아니라 **이미 채택된 규칙의 원인 분해**다 — 여기서 나온 수치로 버퍼를 다시 고르지 않는다."""
+    d1, h4 = B.fetch("1d"), B.fetch("4h")
+    bd = M.align_daily(B.bull(d1), h4.index).ffill().fillna(0).values
+    rg_b = bd >= M.CONF
+    rg_h = hysteresis(h4.index, M.CONF, M.CONF - 2)
+    hi = h4.high.rolling(M.H4_N).max().shift(1)
+    lo = h4.low.rolling(M.H4_M).min().shift(1)
+    brk, bdn = (h4.close > hi).values, (h4.close < lo).values
+    k = np.asarray(h4.index >= pd.Timestamp(START, tz="UTC"))
+    fl = Q.reclaim_fills()
+    hs = h4[k]
+
+    print(f"OKX BTC 4h {hs.index[0]:%Y-%m-%d}~{hs.index[-1]:%Y-%m-%d} · CONF={M.CONF} · 버퍼 2 (6 켜짐 / 4 미만 꺼짐)")
+    print(f"고정 {BASE_LEV}배 · 분봉 하한 재확보 · 고친 엔진")
+
+    # ── 기계 자체를 먼저 본다: 국면이 얼마나 자주, 얼마나 짧게 깜빡이는가 ──
+    off = ~rg_b
+    runs, i, n = [], 0, len(rg_b)
+    while i < n:
+        if off[i]:
+            j = i
+            while j < n and off[j]:
+                j += 1
+            if i > 0 and j < n:                      # 앞뒤가 모두 ON 인 '깜빡임' 만 센다
+                runs.append(j - i)
+            i = j
+        else:
+            i += 1
+    runs = np.array(runs)
+    print(f"{NL}── 국면이 꺼졌다 켜진 구간 {len(runs)}개의 길이 분포 (4h 봉) ──")
+    for lim in (1, 2, 3, 6, 12):
+        print(f"   {lim:2d}봉 이하 ({lim*4:3d}시간): {int((runs <= lim).sum()):3d}개 "
+              f"({(runs <= lim).mean()*100:4.1f}%)")
+    print(f"   중앙값 {np.median(runs):.0f}봉 · 평균 {runs.mean():.1f}봉 · 최장 {runs.max()}봉")
+    print(f"   → 버퍼 2 는 이 중 짧은 것들을 메운다. 실제로 메운 구간: "
+          f"{int((rg_h & ~rg_b).sum())}봉 (전체의 {(rg_h & ~rg_b).mean()*100:.1f}%)")
+
+    # ── 2x2 ──
+    combos = {"기준 (둘 다 기본)": (rg_b, rg_b), "진입만 히스테리시스": (rg_h, rg_b),
+              "청산만 히스테리시스": (rg_b, rg_h), "둘 다 (채택 후보)": (rg_h, rg_h)}
+    print(f"{NL}{'':24s}{'──── 탐색 ────':>22} |{'──── 검증 ────':>22} |{'────── 전체 ──────':>28}"
+          f"{'거래':>5}{'승률':>6}{'최악':>7}{'청산':>4}")
+    print(f"{'':24s}{'CAGR':>7}{'MDD':>7}{'Sh':>6} |{'CAGR':>7}{'MDD':>7}{'Sh':>6} |"
+          f"{'누적':>9}{'MDD':>7}{'Sh':>6}")
+    print()
+    R = {}
+    for nm, (ri, rx) in combos.items():
+        en, ex = (brk & ri)[k], (bdn | ~rx)[k]
+        z = np.zeros(len(hs), bool)
+        R[nm] = E.run(hs, en, ex, z, z, lambda i, c: BASE_LEV, allow=("long",), fills=fl)
+        Q.report(nm, R[nm][0], R[nm][1].ret.values if len(R[nm][1]) else np.zeros(1), R[nm][2])
+
+    # ── 청산 사유 분해 ──
+    print(f"{NL}── 청산이 무엇 때문에 났나 (청산 신호가 선 봉에서) ──")
+    print(f"   {'':24s}{'구조 이탈만':>12}{'국면 붕괴만':>12}{'둘 다':>10}{'만기/미청산':>12}")
+    for nm, (ri, rx) in combos.items():
+        t = R[nm][1]
+        if not len(t):
+            continue
+        sig = np.where(k)[0][0]
+        a = b = c = o = 0
+        for j in t.i_out.values:
+            g = sig + j - 1                                  # 청산 신호가 선 봉 (engine 은 i-1 을 본다)
+            if g >= len(bdn):
+                o += 1; continue
+            s_, r_ = bool(bdn[g]), not bool(rx[g])
+            a += s_ and not r_; b += r_ and not s_; c += s_ and r_; o += not s_ and not r_
+        print(f"   {nm:24s}{a:11d}건{b:11d}건{c:9d}건{o:11d}건")
+
+    f = lambda r, lo_, hi_: Q.metrics(r[0], r[1].ret.values if len(r[1]) else np.zeros(1), r[2], lo_, hi_)
+    bs = f(R["기준 (둘 다 기본)"], None, None)["sharpe"]
+    print(f"{NL}── 기여 분해 (전체 Sharpe) ──")
+    for nm in combos:
+        v = f(R[nm], None, None)["sharpe"]
+        print(f"   {nm:24s} {v:.2f}   ({v - bs:+.2f})")
+    print(f"{NL}   ※ 이 표로 버퍼·문턱을 다시 고르지 않는다. 원인 분해 전용이다.")
+
+
 if __name__ == "__main__":
     sys.stdout.reconfigure(encoding="utf-8")
-    main()
+    (decomp if "--decomp" in sys.argv else main)()

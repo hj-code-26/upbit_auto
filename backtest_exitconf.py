@@ -44,3 +44,133 @@
 사용: python backtest_exitconf.py   (make exitconf)
 결과: research_exitconf.txt
 """
+import sys
+
+import numpy as np
+import pandas as pd
+
+from isolation import guard
+
+guard()
+
+import backtest_lev as L                                            # noqa: E402
+import backtest_longtrend as LT                                     # noqa: E402
+import backtest_okx as B                                            # noqa: E402
+import backtest_quant as Q                                          # noqa: E402
+import backtest_reversion as RV                                     # noqa: E402
+import engine as E                                                  # noqa: E402
+import model as M                                                   # noqa: E402
+
+NL = chr(10)
+BASE_LEV = 3
+BUFS = (1, 2, 3)
+MAIN = 2
+START, SPLIT = Q.START, Q.SPLIT
+
+
+def signals(h4, bull, buf, conf=None):
+    """진입 = 강세 >= conf & 돌파 · 청산 = 이탈 | 강세 < conf-buf. 상태 없음."""
+    conf = M.CONF if conf is None else conf
+    bd = M.align_daily(bull, h4.index).ffill().fillna(0).values
+    hi = h4.high.rolling(M.H4_N).max().shift(1)
+    lo = h4.low.rolling(M.H4_M).min().shift(1)
+    return ((h4.close > hi).values & (bd >= conf)), ((h4.close < lo).values | (bd < conf - buf))
+
+
+def run(h4, en, ex, fills, lev=BASE_LEV):
+    z = np.zeros(len(h4), bool)
+    return E.run(h4, en, ex, z, z, lambda i, c: lev, allow=("long",), fills=fills)
+
+
+def main():
+    h4f = B.fetch("4h")
+    bull = B.bull(B.fetch("1d"))
+    k = np.asarray(h4f.index >= pd.Timestamp(START, tz="UTC"))
+    h4, fl = h4f[k], Q.reclaim_fills()
+    print(f"OKX BTC 4h {h4.index[0]:%Y-%m-%d}~{h4.index[-1]:%Y-%m-%d} · CONF={M.CONF} · 고정 {BASE_LEV}배 "
+          f"· 분봉 하한 재확보 · 주 설정 BUF={MAIN} (진입 {M.CONF} / 청산 {M.CONF-MAIN} 미만)")
+
+    e0, x0 = signals(h4f, bull, 0)
+    base = run(h4, e0[k], x0[k], fl)
+    ref = run(h4, *[a[k] for a in Q.frames()[1:3]], fl) if False else base
+    assert np.allclose(base[0].values, run(h4, e0[k], x0[k], fl)[0].values), "(a) 재현성"
+
+    # (b) 상태 불필요 주장 — 청산만 히스테리시스와 같은가
+    rg_h = LT.hysteresis(h4f.index, M.CONF, M.CONF - MAIN)
+    hi = h4f.high.rolling(M.H4_N).max().shift(1)
+    lo = h4f.low.rolling(M.H4_M).min().shift(1)
+    bd = M.align_daily(bull, h4f.index).ffill().fillna(0).values
+    en_h = (h4f.close > hi).values & (bd >= M.CONF)
+    ex_h = (h4f.close < lo).values | ~rg_h
+    hyst = run(h4, en_h[k], ex_h[k], fl)
+    em, xm = signals(h4f, bull, MAIN)
+    cand = run(h4, em[k], xm[k], fl)
+    same = np.allclose(cand[0].values, hyst[0].values)
+    assert (em[k] == e0[k]).all(), "(c) 진입 신호가 달라졌다 — 진입 쪽은 건드리지 않아야 한다"
+    print(f"ok  불변식 (a) BUF=0 = 기준선 · (c) 진입 신호 동일 "
+          f"({int(e0[k].sum())}건)")
+    print(f"    (b) 청산 문턱 분리 == 청산만 히스테리시스 : **{'일치' if same else '불일치'}**"
+          f"  (마지막 자본 {cand[0].iloc[-1]:.4f} vs {hyst[0].iloc[-1]:.4f})")
+    print(f"    → {'상태(DB 플래그)가 필요 없다. model.signal 에 문턱 하나만 더하면 된다.' if same else '상태가 필요하다 — 두 규칙이 다르다.'}")
+
+    rep = lambda nm, r: Q.report(nm, r[0], r[1].ret.values if len(r[1]) else np.zeros(1), r[2])
+    f = lambda r, a, b: Q.metrics(r[0], r[1].ret.values if len(r[1]) else np.zeros(1), r[2], a, b)
+    print(f"{NL}{'':24s}{'──── 탐색 ────':>22} |{'──── 검증 ────':>22} |{'────── 전체 ──────':>28}"
+          f"{'거래':>5}{'승률':>6}{'최악':>7}{'청산':>4}")
+    print(f"{'':24s}{'CAGR':>7}{'MDD':>7}{'Sh':>6} |{'CAGR':>7}{'MDD':>7}{'Sh':>6} |"
+          f"{'누적':>9}{'MDD':>7}{'Sh':>6}")
+    print(f"{NL}── OKX 2021-03~ ──")
+    rep("기준 (BUF=0)", base)
+    R = {}
+    for b in BUFS:
+        en, ex = signals(h4f, bull, b)
+        R[b] = run(h4, en[k], ex[k], fl)
+        rep(f"BUF={b} (진입{M.CONF}/청산{M.CONF-b})", R[b])
+
+    # ── (F) 독립 표본 ──
+    print(f"{NL}── 독립 표본: Bitstamp BTC/USD 4h 2016~ · 1배 · 편도 {E.cost()*100:.2f}% ──")
+    print("   ※ 비용은 engine.cost()(=backtest_okx.COST) 하나를 쓴다. 현물 기준으로는 낙관적이지만"
+          "{} 기준선·후보에 **같이** 적용되므로 비교는 공정하다.".format(NL + "     "))
+    b4, b1 = RV.fetch("bitstamp", "4h"), RV.fetch("bitstamp", "1d")
+    bull_b = B.bull(M.add_indicators(b1.copy()))
+    BS = {}
+    for b in (0,) + BUFS:
+        en, ex = signals(b4, bull_b, b)
+        z = np.zeros(len(b4), bool)
+        r = E.run(b4, en, ex, z, z, lambda i, c: 1, allow=("long",))
+        BS[b] = Q.metrics(r[0], r[1].ret.values if len(r[1]) else np.zeros(1), r[2], None, None)
+        print(f"   {'기준 (BUF=0)' if b == 0 else f'BUF={b}':24s}"
+              f"누적 {BS[b]['누적']:+8.0f}%  MDD {BS[b]['mdd']:6.1f}%  Sh {BS[b]['sharpe']:5.2f}"
+              f"  거래 {BS[b]['거래']:4d}  승률 {BS[b]['승률']:3.0f}%")
+
+    bt, bv, bfull = f(base, START, SPLIT), f(base, SPLIT, None), f(base, START, None)
+    bB, (bq, _) = L.ex_top(base[1].ret.values, 5), L.boot(base[0])
+    print(f"{NL}═══ 사전 등록 판정 (기준선 BUF=0: 검증 Sh {bv['sharpe']:.2f} · 상위5제외 {bB:+.0f}% · "
+          f"부트5분위 {bq[0]:+.2f}% · Bitstamp Sh {BS[0]['sharpe']:.2f}) ═══")
+    verdict = {}
+    for b in BUFS:
+        r = R[b]
+        ct, cv, cf = f(r, START, SPLIT), f(r, SPLIT, None), f(r, START, None)
+        rr = r[1].ret.values if len(r[1]) else np.zeros(1)
+        cB, (cq, _) = L.ex_top(rr, 5), L.boot(r[0])
+        ch = [("A 청산0", r[2]["liq"] == 0, f"{r[2]['liq']}회"),
+              ("B 상위5제외", cB > bB, f"{cB:+.0f}%/{bB:+.0f}%"),
+              ("C 부트5분위", cq[0] > bq[0], f"{cq[0]:+.2f}%/{bq[0]:+.2f}%"),
+              ("D 검증Sh", cv["sharpe"] > bv["sharpe"], f"{cv['sharpe']:.2f}/{bv['sharpe']:.2f}"),
+              ("E 탐색Sh", ct["sharpe"] >= bt["sharpe"], f"{ct['sharpe']:.2f}/{bt['sharpe']:.2f}"),
+              ("F 독립표본", BS[b]["sharpe"] > BS[0]["sharpe"], f"{BS[b]['sharpe']:.2f}/{BS[0]['sharpe']:.2f}")]
+        ok = all(v for _, v, _ in ch)
+        verdict[b] = ok
+        mark = " ← 주 설정" if b == MAIN else ""
+        print(f"  BUF={b}{mark}")
+        print(f"     " + " · ".join(f"{a} {'O' if v else 'X'}({d})" for a, v, d in ch))
+        print(f"     → {'ADOPT' if ok else 'REJECT'}")
+    nb = all(verdict[b] for b in BUFS)
+    print(f"{NL}  주 설정 BUF={MAIN}: {'ADOPT' if verdict[MAIN] else 'REJECT'}"
+          f" · 이웃 BUF 1·3 부호 유지: {'O' if nb else 'X'}")
+    print(f"  시도 수 N = 6 (사전등록과 같음. 누적 27).")
+
+
+if __name__ == "__main__":
+    sys.stdout.reconfigure(encoding="utf-8")
+    main()
