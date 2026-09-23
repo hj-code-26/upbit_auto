@@ -62,3 +62,237 @@
 사용: python backtest_longtrend.py   (make longtrend)
 결과: research_longtrend.txt
 """
+import sys
+
+import numpy as np
+import pandas as pd
+
+from isolation import guard
+
+guard()
+
+import backtest_flow as FL                                          # noqa: E402
+import backtest_lev as L                                            # noqa: E402
+import backtest_okx as B                                            # noqa: E402
+import backtest_quant as Q                                          # noqa: E402
+import engine as E                                                  # noqa: E402
+import model as M                                                   # noqa: E402
+
+NL = chr(10)
+BASE_LEV = 3                     # 2026-09-21 레버리지 다이얼이 권고한 지점
+CTX_LEV = (1, 5)                 # 맥락용
+MOM_WINS = ((252, 21), (126, 21), (378, 21))      # 12-1 · 6-1 · 18-1 개월
+SMA_WINS = (100, 200, 300)
+BUFFERS = (1, 2, 3)
+START, SPLIT = Q.START, Q.SPLIT
+
+
+def long_signals(h4_index):
+    """바이낸스 일봉으로 만든 장기 필터들을 4h 봉에 붙인다. 정렬은 model.align_daily 와 같다."""
+    d = FL.taker("1d").close
+    out = {}
+    for lb, skip in MOM_WINS:
+        s = (d.shift(skip) / d.shift(lb) - 1) > 0                   # t-lb -> t-skip 수익률 > 0
+        out[f"mom{lb}-{skip}"] = M.align_daily(s, h4_index).fillna(False).astype(bool).values
+    for n in SMA_WINS:
+        out[f"sma{n}"] = M.align_daily(d > d.rolling(n).mean(), h4_index).fillna(False).astype(bool).values
+    return out
+
+
+def hysteresis(h4_index, enter=None, exit_at=None):
+    """국면 히스테리시스: 강세 규칙 enter개 이상이면 켜지고, exit_at개 미만으로 떨어져야 꺼진다."""
+    enter = M.CONF if enter is None else enter
+    bd = M.align_daily(B.bull(B.fetch("1d")), h4_index).ffill().fillna(0).values
+    out, on = np.zeros(len(h4_index), bool), False
+    for i, v in enumerate(bd):
+        on = (v >= enter) if not on else (v >= exit_at)
+        out[i] = on
+    return out
+
+
+def hyst_signals(enter, exit_at):
+    """히스테리시스 국면으로 **진입·청산 신호를 다시 만든다.**
+
+    2026-09-23: 처음에는 engine 의 gate 로 넣었는데 그건 틀린 배선이었다 — 히스테리시스는 국면을
+    **더 오래 켜두는** 규칙이고 gate 는 조이기만 하므로 0건 차단, 즉 아무 일도 하지 않았다.
+    국면은 진입 조건(국면 & 돌파)과 청산 조건(이탈 | 국면 붕괴) 양쪽에 들어가므로 여기서 둘 다 다시 만든다."""
+    d1, h4 = B.fetch("1d"), B.fetch("4h")
+    rg = pd.Series(hysteresis(h4.index, enter, exit_at), index=h4.index)
+    hi = h4.high.rolling(M.H4_N).max().shift(1)
+    lo = h4.low.rolling(M.H4_M).min().shift(1)
+    return h4, ((h4.close > hi) & rg).values, ((h4.close < lo) | ~rg).values
+
+
+def episodes(g):
+    """게이트가 닫혔다 열린 구간의 수. 사건 하나에 건 베팅인지 보는 지표."""
+    d = np.diff(np.concatenate([[True], g.astype(bool)]).astype(int))
+    return int((d < 0).sum())
+
+
+def run(h4, en, ex, fills, lev, gate=None):
+    z = np.zeros(len(h4), bool)
+    return E.run(h4, en, ex, z, z, lambda i, c: lev, allow=("long",), fills=fills, gate=(gate, None) if gate is not None else None)
+
+
+def main():
+    h4, entry, exit_, _, _ = Q.frames()
+    m = h4.index >= pd.Timestamp(START, tz="UTC")
+    h4, entry, exit_ = h4[m], entry[m], exit_[m]
+    fl = Q.reclaim_fills()
+    S = long_signals(h4.index)
+    print(f"OKX BTC 4h {h4.index[0]:%Y-%m-%d}~{h4.index[-1]:%Y-%m-%d} · CONF={M.CONF} · 편도 {Q.COST*100:.2f}%"
+          f" · 진입 분봉 하한 재확보 · 기준선 고정 {BASE_LEV}배")
+    print("장기 필터 가격 = 바이낸스 USDT-M 일봉 2019-09~ (OKX 는 252일 사전이력이 없다). 부호만 쓴다.")
+
+    base = run(h4, entry, exit_, fl, BASE_LEV)
+    G = {"L1 12-1개월>0": S["mom252-21"], "L2 종가>200일선": S["sma200"],
+         "L3 L1 & L2": S["mom252-21"] & S["sma200"]}
+
+    def hyst_run(buf, lev=BASE_LEV):
+        """히스테리시스는 게이트가 아니라 국면 자체를 바꾼다 → 신호를 다시 만들어 돌린다."""
+        hf, he, hx = hyst_signals(M.CONF, M.CONF - buf)
+        k = hf.index >= pd.Timestamp(START, tz="UTC")
+        return run(hf[k], he[k], hx[k], fl, lev)
+
+    allopen = run(h4, entry, exit_, fl, BASE_LEV, np.ones(len(h4), bool))
+    assert np.allclose(allopen[0].values, base[0].values), "(a) 게이트를 다 열었는데 기준선과 다르다"
+    d = FL.taker("1d").close
+    half = len(d) // 2
+    s_full = M.align_daily((d.shift(21) / d.shift(252) - 1) > 0, h4.index).fillna(False).astype(bool).values
+    s_cut = M.align_daily((d[:half].shift(21) / d[:half].shift(252) - 1) > 0, h4.index).fillna(False).astype(bool).values
+    upto = h4.index <= d.index[half - 1]
+    assert (s_full[upto] == s_cut[upto]).all(), "(c) 표본을 자르면 과거 게이트 값이 달라진다 = 미래 참조"
+    # (c) 히스테리시스도 미래를 보지 않는가 — 인과 루프인지 잘라서 확인한다
+    hy_full = hysteresis(h4.index, M.CONF, M.CONF - 2)
+    k2 = len(h4) // 2
+    hy_cut = hysteresis(h4.index[:k2], M.CONF, M.CONF - 2)
+    assert (hy_full[:k2] == hy_cut).all(), "(c) 히스테리시스가 미래를 본다 — 표본을 자르면 과거 값이 달라진다"
+    print("ok  불변식 (a) 게이트 전부 열면 = 기준선 · (c) 장기필터·히스테리시스 모두 표본 절단에 불변")
+
+    # ── 사건 수를 판정보다 먼저 센다 ──
+    print(f"{NL}── 사건 수 (판정 전에 먼저 본다) ──")
+    print("   구간이 3개 미만이면 통계가 아니라 사건 한두 개에 건 베팅이다 → INCONCLUSIVE")
+    ent_i = np.array([i for i in range(1, len(h4)) if entry[i - 1]])
+    fires = {}
+    for buf in BUFFERS:
+        hf, he, hx = hyst_signals(M.CONF, M.CONF - buf)
+        k = hf.index >= pd.Timestamp(START, tz="UTC")
+        fires[f"H1 히스테리시스 {M.CONF}/{M.CONF-buf}"] = episodes(hysteresis(h4.index, M.CONF, M.CONF - buf))
+        print(f"   H1 버퍼 {buf} ({M.CONF}/{M.CONF-buf}): 국면 켜진 비율 "
+              f"{hysteresis(h4.index, M.CONF, M.CONF-buf).mean()*100:4.1f}% (기준 국면 "
+              f"{M.align_daily(B.bull(B.fetch('1d')) >= M.CONF, h4.index).fillna(False).mean()*100:4.1f}%)"
+              f" · 진입 신호 {int(he[k].sum()):3d}건 (기준 {int(entry.sum()):3d}건)")
+    for n, g in G.items():
+        blocked = int((~g[ent_i - 1]).sum())
+        ep = episodes(g)
+        fires[n] = ep
+        print(f"   {n:22s} 닫힌 구간 {ep:2d}개 · 게이트가 막은 진입 {blocked:3d}/{len(ent_i)}건 "
+              f"({blocked/len(ent_i)*100:4.1f}%) · 전체 봉 중 열린 비율 {g.mean()*100:4.1f}%")
+
+    rep = lambda nm, r: Q.report(nm, r[0], r[1].ret.values if len(r[1]) else np.zeros(1), r[2])
+    f = lambda r, lo, hi: Q.metrics(r[0], r[1].ret.values if len(r[1]) else np.zeros(1), r[2], lo, hi)
+    print(f"{NL}{'':24s}{'──── 탐색 ────':>22} |{'──── 검증 ────':>22} |{'────── 전체 ──────':>28}"
+          f"{'거래':>5}{'승률':>6}{'최악':>7}{'청산':>4}")
+    print(f"{'':24s}{'CAGR':>7}{'MDD':>7}{'Sh':>6} |{'CAGR':>7}{'MDD':>7}{'Sh':>6} |"
+          f"{'누적':>9}{'MDD':>7}{'Sh':>6}")
+    print(f"{NL}── 기준선 ──")
+    rep(f"고정 {BASE_LEV}배 (권고 지점)", base)
+    for lv in CTX_LEV:
+        rep(f"  참고: 고정 {lv}배", run(h4, entry, exit_, fl, lv))
+
+    print(f"{NL}── 후보 (전부 {BASE_LEV}배) ──")
+    R = {}
+    for n, g in G.items():
+        R[n] = run(h4, entry, exit_, fl, BASE_LEV, g)
+        assert R[n][1].shape[0] <= base[1].shape[0], f"(b) {n}: 게이트가 거래를 늘렸다"
+        rep(n, R[n])
+    R[f"H1 히스테리시스 {M.CONF}/{M.CONF-2}"] = hyst_run(2)
+    rep(f"H1 히스테리시스 {M.CONF}/{M.CONF-2}", R[f"H1 히스테리시스 {M.CONF}/{M.CONF-2}"])
+
+    print(f"{NL}── 이웃 격자 ──")
+    NB = {}
+    for lb, sk in MOM_WINS:
+        NB[f"모멘텀 {lb}-{sk}"] = S[f"mom{lb}-{sk}"]
+    for n in SMA_WINS:
+        NB[f"이평 {n}일"] = S[f"sma{n}"]
+    for n, g in NB.items():
+        rep(n, run(h4, entry, exit_, fl, BASE_LEV, g))
+    for b in BUFFERS:
+        rep(f"히스테리시스 {M.CONF}/{M.CONF-b}", hyst_run(b))
+
+    bt, bv, bf = f(base, START, SPLIT), f(base, SPLIT, None), f(base, START, None)
+    bB, (bq, _) = L.ex_top(base[1].ret.values, 5), L.boot(base[0])
+    print(f"{NL}═══ 사전 등록 판정 (기준선 = 고정 {BASE_LEV}배: 검증 Sh {bv['sharpe']:.2f} · "
+          f"상위5제외 {bB:+.0f}% · 부트5분위 {bq[0]:+.2f}%) ═══")
+    for n, r in R.items():
+        ct, cv, cf = f(r, START, SPLIT), f(r, SPLIT, None), f(r, START, None)
+        rr = r[1].ret.values if len(r[1]) else np.zeros(1)
+        cB, (cq, _) = L.ex_top(rr, 5), L.boot(r[0])
+        ch = [("A 청산0", r[2]["liq"] == 0, f"{r[2]['liq']}회"),
+              ("B 상위5제외", cB > bB, f"{cB:+.0f}% vs {bB:+.0f}%"),
+              ("C 부트5분위", cq[0] > bq[0], f"{cq[0]:+.2f}% vs {bq[0]:+.2f}%"),
+              ("D 검증Sh", cv["sharpe"] > bv["sharpe"], f"{cv['sharpe']:.2f} vs {bv['sharpe']:.2f}"),
+              ("E 탐색Sh", ct["sharpe"] >= bt["sharpe"], f"{ct['sharpe']:.2f} vs {bt['sharpe']:.2f}")]
+        ok = all(v for _, v, _ in ch)
+        bad = fires[n] < 3
+        print(f"  {n:22s} " + " · ".join(f"{a} {'O' if v else 'X'}({d})" for a, v, d in ch))
+        print(f"  {'':22s}   → {'INCONCLUSIVE (사건 %d개)' % fires[n] if bad else ('ADOPT' if ok else 'REJECT')}")
+    print(f"{NL}  시도 수 N = 13 (사전등록과 같음).")
+
+    # ── 사전등록 밖의 독립 확인. ADOPT 가 나왔을 때만 의미가 있다 ──
+    print(f"{NL}{'='*78}{NL}── [사전등록 밖] 히스테리시스 독립 확인 — N 이 늘어난다 ──")
+    print("   채택 후보가 나왔으므로 다른 축에서도 버티는지 본다. 이 표로 버퍼를 다시 고르지는 않는다.")
+    print(f"{NL}   (1) 레버리지 축 — 6/4 버퍼 고정")
+    for lv in (1, 3, 5):
+        rep(f"  기준 {lv}배", run(h4, entry, exit_, fl, lv))
+        rep(f"  +히스 6/4 {lv}배", hyst_run(2, lv))
+    print(f"{NL}   (2) CONF 축 — 버퍼 2 고정 (문턱과 버퍼를 같이 옮긴다)")
+    keep = M.CONF
+    for conf in (5, 6, 7, 8):
+        M.CONF = conf
+        d1, hh = B.fetch("1d"), B.fetch("4h")
+        rg = M.align_daily(B.bull(d1) >= conf, hh.index).fillna(False).astype(bool)
+        hi, lo = hh.high.rolling(M.H4_N).max().shift(1), hh.low.rolling(M.H4_M).min().shift(1)
+        kk = hh.index >= pd.Timestamp(START, tz="UTC")
+        b = run(hh[kk], ((hh.close > hi) & rg).values[kk], ((hh.close < lo) | ~rg).values[kk], fl, BASE_LEV)
+        rep(f"  기준 CONF={conf}", b)
+        rep(f"  +히스 {conf}/{conf-2}", hyst_run(2))
+    M.CONF = keep
+
+    # ── 독립 표본: Bitstamp BTC/USD 2016~ (우리 표본은 2021-03~. 2016~2021 은 완전히 새 데이터다) ──
+    print(f"{NL}   (3) 독립 표본 — Bitstamp BTC/USD 4h 2016~ · 1배(현물 가정) · 편도 0.10%")
+    print("       이게 갈라준다. CONF 축에서 뒤집힌 것이 표본 운인지 진짜 한계인지.")
+    import backtest_reversion as RV
+    b4, b1 = RV.fetch("bitstamp", "4h"), RV.fetch("bitstamp", "1d")
+    bull_b = B.bull(M.add_indicators(b1.copy()))
+    hi_b = b4.high.rolling(M.H4_N).max().shift(1)
+    lo_b = b4.low.rolling(M.H4_M).min().shift(1)
+
+    def bs_run(buf=None, conf=6, lev=1):
+        rg_raw = M.align_daily(bull_b, b4.index).ffill().fillna(0).values
+        if buf is None:
+            rg = rg_raw >= conf
+        else:
+            rg, on = np.zeros(len(b4), bool), False
+            for i, v in enumerate(rg_raw):
+                on = (v >= conf) if not on else (v >= conf - buf)
+                rg[i] = on
+        rg = pd.Series(rg, index=b4.index)
+        en, ex2 = ((b4.close > hi_b) & rg).values, ((b4.close < lo_b) | ~rg).values
+        z = np.zeros(len(b4), bool)
+        return E.run(b4, en, ex2, z, z, lambda i, c: lev, allow=("long",))
+
+    print(f"       {'':22s}{'전체 누적':>12}{'MDD':>9}{'Sh':>7}{'거래':>6}{'승률':>6}")
+    for conf in (5, 6, 7):
+        for buf in (None, 1, 2, 3):
+            r = bs_run(buf, conf)
+            mt = Q.metrics(r[0], r[1].ret.values if len(r[1]) else np.zeros(1), r[2], None, None)
+            nm = f"CONF={conf} 기준" if buf is None else f"CONF={conf} +히스 버퍼{buf}"
+            print(f"       {nm:22s}{mt['누적']:+11.0f}%{mt['mdd']:8.1f}%{mt['sharpe']:7.2f}"
+                  f"{mt['거래']:6d}{mt['승률']:5.0f}%")
+        print()
+
+
+if __name__ == "__main__":
+    sys.stdout.reconfigure(encoding="utf-8")
+    main()
