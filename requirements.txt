@@ -5,5 +5,4 @@ python-dotenv
 anthropic
 fastapi
 uvicorn
-pyupbit          # upbit.py · liquidate_upbit.py (업비트 잔여 자산 정리) 전용
-scikit-learn     # backtest_upbit.py (옛 분류기 연구) 전용. 봇은 쓰지 않는다
+scikit-learn     # research/aoa 분석 스크립트 전용. 봇은 쓰지 않는다

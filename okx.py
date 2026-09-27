@@ -87,6 +87,21 @@ def candles(ex, count=100, tf="1d"):
     return df.set_index("timestamp").astype(float)
 
 
+def bars_since(ex, since, tf="5m"):
+    """since(UTC) 이후 봉 전부 — UTC 인덱스, 마지막 행은 진행 중일 수 있다. OKX 는 since 조회를 100개씩 준다.
+    봇이 꺼져 있던 동안의 봉까지 따라잡을 때 쓴다 (candles() 는 최근 N개뿐)."""
+    rows, t = [], int(since.timestamp() * 1000)
+    while True:
+        r = ex.fetch_ohlcv(SYMBOL, tf, since=t, limit=100)
+        rows += r
+        if len(r) < 100:
+            break
+        t = r[-1][0] + 1
+    df = pd.DataFrame(rows, columns=["timestamp", "open", "high", "low", "close", "volume"]).drop_duplicates("timestamp")
+    df.index = pd.to_datetime(df.timestamp, unit="ms", utc=True)
+    return df.drop(columns="timestamp").astype(float)
+
+
 def price(ex):
     return float(ex.fetch_ticker(SYMBOL)["last"])
 

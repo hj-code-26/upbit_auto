@@ -10,11 +10,13 @@ import os
 import sqlite3
 import threading
 
+import pandas as pd
 import uvicorn
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, JSONResponse
 
 import autotrade as A
+import strategy as S
 
 app = FastAPI()
 BOT_HERE = False          # 이 프로세스가 주문 락을 잡고 스케줄러를 돌리는가 (__main__ 에서 정한다)
@@ -29,12 +31,10 @@ def next_run(last_ts):
     return (A.dt.datetime.fromisoformat(last_ts) + A.dt.timedelta(minutes=A.INTERVAL_MIN)).isoformat()
 
 
-# '장기 기대 수익률' 근거 = `make current` (backtest_current.py, 2026-09-10 감사 후 엔진) 의 [지금 이 봇] 줄.
-# 예전 값(1배 +117% × 레버리지 단리 근사)은 수정 전 엔진이었고 5배를 곱하면 MDD 가 −105% 로 나오는 등 틀렸다.
-# 이 레버리지와 .env LEVERAGE 가 다르면 화면에 '재측정 필요' 가 뜬다.
-BACKTEST = {"from": "2021-03-01", "to": "2026-09-09", "lev": 5, "vt": 0, "total": 2018, "cagr_a": 79, "cagr_b": 68,
-            "mdd": -62.8, "sharpe": 0.71, "trades": 117, "win": 36, "worst": -29.1,
-            "lev1": {"total": 202, "mdd": -17.8}, "hodl": 60, "hodl_mdd": -76.7}
+# '장기 기대 수익률' 근거 = research/aoa/dip_lev2_result.txt (strategy.py 규칙 그대로 재생, 1배, 비용·펀딩 포함).
+# 대표값은 실제로 거래할 OKX 구간. 이 레버리지와 .env LEVERAGE 가 다르면 화면에 '재측정 필요' 가 뜬다.
+BACKTEST = {"src": "OKX 2021-05~2026-09", "lev": 1, "cagr": 8.7, "mdd": -13, "win": 75, "trades": 32, "per_trade": 1.49,
+            "more": [["바이낸스 2020-03~2026-09", 20.0, -16], ["BitMEX 2018-03~2021-12", 27.9, -37]]}
 
 
 def rows(sql):
@@ -59,7 +59,7 @@ def live_account(demo=None):
 def api_state():
     runs = rows("SELECT * FROM runs ORDER BY id DESC LIMIT 200")
     return {"mode": A.MODE, "live_now": A.live_now(), "have_keys": A.HAVE_KEYS, "coin": A.X.COIN, "demo": A.X.DEMO,
-            "leverage": A.LEVERAGE, "position_pct": A.POSITION_PCT, "allow_short": A.ALLOW_SHORT, "extreme_min": A.EXTREME_MIN, "lev_now": A.target_leverage(A.live_now()),
+            "leverage": A.LEVERAGE, "position_pct": A.POSITION_PCT, "rule": {"D": S.D, "TP": S.TP, "SL": S.SL, "hours": S.MAXB * 5 / 60},
             "paper_done": A.paper_trades_done(), "live_after": A.LIVE_AFTER, "autorun": A.autorun(),
             "use_claude": A.USE_CLAUDE, "claude_model": A.CLAUDE_MODEL, "backtest": BACKTEST,
             "real_first": next((r["real_equity"] for r in rows("SELECT real_equity FROM runs WHERE real_equity > 0 ORDER BY id LIMIT 1")), None),
@@ -72,15 +72,35 @@ def api_state():
 
 @app.get("/api/analysis")
 def api_analysis():
-    """코인 차트 + 알고리즘 진행 과정 (마지막 완성 일봉의 규칙 8개 판정 + 마지막 완성 4h 봉의 돌파·이탈 → 구역)."""
+    """차트 + 알고리즘 진행 과정: 전날 종가 vs 50·200일선 → 마지막 완성 5분봉의 1h 이평 괴리 → 자리 → 포지션 관리.
+    봇과 같은 strategy.indicators 를 쓴다."""
     pub = A.X.public()
-    df, h4 = A.X.candles(pub, 120), A.X.candles(pub, A.H4_CANDLES, "4h")
-    ex = A.M.signal(df.iloc[:-1], h4.iloc[:-1])
-    ex["candles"] = [{"t": t.strftime("%Y-%m-%d"), "o": r.open, "h": r.high, "l": r.low, "c": r.close, "v": r.volume} for t, r in df.iterrows()]
-    ex["price"] = A.X.price(pub)
-    ex["next_bar"] = (h4.index[-1] + A.dt.timedelta(hours=4)).strftime("%m-%d %H:%M")   # 진행 중인 4h 봉 마감 (KST)
-    ex["orders"] = rows("SELECT timestamp, action, price FROM orders WHERE status IN ('paper','submitted') ORDER BY id")
-    return ex
+    df = A.X.candles(pub, A.DAILY)                                  # 마지막 행 = 진행 중인 오늘 (09:00 KST 경계)
+    d1 = df.close.iloc[:-1]
+    d1.index = d1.index.tz_convert("UTC")
+    now = pd.Timestamp.now(tz="UTC")
+    raw = A.X.bars_since(pub, now - A.WARMUP)
+    c5 = raw[raw.index + S.BAR <= now]
+    dev, bull = S.indicators(c5, d1)
+    ema = c5.close.ewm(span=12, adjust=False).mean()
+    m50, m200 = df.close.rolling(50).mean(), df.close.rolling(200).mean()
+    t = c5.index[-1]
+    out = {"candles": [{"t": i.strftime("%Y-%m-%d"), "o": r.open, "h": r.high, "l": r.low, "c": r.close, "v": r.volume,
+                        "m50": None if pd.isna(m50[i]) else m50[i], "m200": None if pd.isna(m200[i]) else m200[i]}   # NaN 은 JSON 불가
+                       for i, r in df.tail(120).iterrows()],
+           "price": A.X.price(pub), "date": d1.index[-1].strftime("%Y-%m-%d"), "prev_close": d1.iloc[-1],
+           "sma50": d1.rolling(50).mean().iloc[-1], "sma200": d1.rolling(200).mean().iloc[-1], "trend_ok": bool(bull.iloc[-1]),
+           "bar": t.tz_convert(A.KST).strftime("%m-%d %H:%M"), "close": c5.close.iloc[-1], "ema": ema.iloc[-1],
+           "dev": dev.iloc[-1], "trigger_px": ema.iloc[-1] * (1 - S.D / 100), "signal": S.signal(dev.iloc[-1], bull.iloc[-1]),
+           "rule": {"D": S.D, "TP": S.TP, "SL": S.SL, "hours": S.MAXB * 5 / 60},
+           "next_bar": (t + 2 * S.BAR).tz_convert(A.KST).strftime("%H:%M"),       # 진행 중인 5분봉 마감
+           "orders": rows("SELECT timestamp, action, price FROM orders WHERE status IN ('paper','submitted') ORDER BY id")}
+    st = A.state()
+    if st["side"] == "long":
+        up, dn = S.levels(st["entry"])
+        out["position"] = {"entry": st["entry"], "tp": up, "sl": dn,
+                           "expiry": (A.entry_bar(st["entered_at"]) + S.MAXB * S.BAR).tz_convert(A.KST).strftime("%m-%d %H:%M")}
+    return out
 
 
 @app.post("/api/run")
@@ -114,7 +134,7 @@ def api_order(body: dict):
 
 
 PAGE = r"""<!doctype html><html lang=ko><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
-<title>BTC 국면·돌파 봇 · OKX</title>
+<title>BTC 급락 매수 봇 · OKX</title>
 <link rel=stylesheet href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/static/pretendard.min.css">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
 <style>
@@ -157,13 +177,10 @@ h2{font-size:17px;font-weight:700;margin:0 0 14px;letter-spacing:-.3px}
 .step .n{width:28px;height:28px;border-radius:50%;background:var(--blue-bg);color:var(--blue);font-weight:700;font-size:13px;display:flex;align-items:center;justify-content:center;flex-shrink:0}
 .step .n.off{background:var(--gray-bg);color:var(--t3)}.step .n.act{background:var(--red-bg);color:var(--red)}
 .step .b{flex:1;min-width:0}.step .b b{display:block;font-size:15px;font-weight:600}.step .b span{display:block;font-size:13px;color:var(--t2);margin-top:3px;line-height:1.5}
-.rules{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:6px;margin-top:8px}
-.rule{display:flex;justify-content:space-between;gap:8px;background:var(--gray-bg);border-radius:10px;padding:8px 12px;font-size:13px}.rule em{font-style:normal;font-weight:700}
-.rule.bull em{color:var(--red)}.rule.bear em{color:var(--blue)}.rule.none em{color:var(--t3)}
 .toast{position:fixed;left:50%;bottom:28px;transform:translateX(-50%);background:#191f28;color:#fff;padding:12px 18px;border-radius:12px;font-size:14px;opacity:0;transition:.25s;pointer-events:none}.toast.on{opacity:1}
 </style>
 <div class=wrap>
-<header><h1>BTC 국면·돌파 봇 <span style="font-size:13px;color:var(--t3);font-weight:500">OKX 선물</span></h1><div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap"><span class=pill id=mode><i></i>불러오는 중</span><span class=pill id=lev></span><button class=btn id=autobtn onclick="autorun()">-</button><button class=btn id=runbtn onclick="run()">지금 판단하기</button></div></header>
+<header><h1>BTC 급락 매수 봇 <span style="font-size:13px;color:var(--t3);font-weight:500">OKX 선물</span></h1><div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap"><span class=pill id=mode><i></i>불러오는 중</span><span class=pill id=lev></span><button class=btn id=autobtn onclick="autorun()">-</button><button class=btn id=runbtn onclick="run()">지금 판단하기</button></div></header>
 <div class=hero>
   <div class=card><div class=label>비트코인 · 현재가 · 오늘 신호</div><div class=big id=price>-</div><div class=sub id=signal>-</div></div>
   <div class=card><div class=label id=eqlabel>내 자산</div><div class=big id=equity>-</div><div class=sub id=eqchg>-</div></div>
@@ -205,12 +222,11 @@ async function load(){
   const md=document.getElementById('mode'), tag=s.demo?'OKX 데모':'실주문';
   if(s.live_now){md.className=s.demo?'pill test':'pill live';md.innerHTML='<i></i>'+tag+' 중'}
   else{md.className='pill';md.innerHTML='<i></i>'+(s.mode==='auto'&&s.have_keys?`모의 장부 ${s.paper_done}/${s.live_after} · 완료 후 ${tag}`:'모의 장부'+(s.have_keys&&!s.demo?' · 실계좌는 잔고만 읽음':''))}
-  document.getElementById('lev').textContent=(s.lev_now&&s.lev_now[1]?`${s.lev_now[0].toFixed(2)}배 (상한 ${s.leverage}) · ${Math.round(s.position_pct*100)}%`:`${s.leverage}배 · ${Math.round(s.position_pct*100)}%`);
-  document.getElementById('lev').title=s.lev_now?s.lev_now[1]:'';
+  document.getElementById('lev').textContent=`${s.leverage}배 · ${Math.round(s.position_pct*100)}%`;
   const rb=document.getElementById('runbtn');if(!s.bot_here){rb.disabled=true;rb.textContent='다른 곳에서 봇 실행 중';rb.title='판단·주문은 터미널(make bot)이 한다 · 이 화면은 보기 전용'}
   const ab=document.getElementById('autobtn');ab.className=s.autorun?'btn':'btn off';ab.textContent=s.autorun?'자동실행 ON':'자동실행 OFF';
   document.getElementById('price').textContent=l.price?f(l.price,1)+' USDT':'-';
-  document.getElementById('signal').innerHTML=l.zone?`<span class="zone ${l.zone}">${Z[l.zone]}</span>&nbsp; 일봉 롱 ${l.bull}/8 · 숏 ${l.bear}/8`:'아직 판단 전';
+  document.getElementById('signal').innerHTML=l.zone?`<span class="zone ${l.zone}">${Z[l.zone]}</span>&nbsp; 1h 이평 대비 ${l.p!=null?(l.p>0?'+':'')+f(l.p,2)+'%':'-'} · 추세 ${l.bull?'통과':'차단'}`:'아직 판단 전';
   const a=s.account, live=a&&!a.error;
   const eq=live?a.equity:l.paper_equity;
   const first=done.length?done[0].paper_equity:null;
@@ -232,10 +248,10 @@ async function load(){
     document.getElementById('retsub').textContent=`${d>0?'+':''}${f(d,2)} USDT · 시작 ${f(base,2)} → 현재 ${f(cur,2)}`+(live&&a.position?' · 미실현 포함':'')}
   else{rt.textContent='-';document.getElementById('retsub').textContent='첫 판단 기록 뒤 표시됩니다'}
   const b=s.backtest, L=s.leverage, stale=b.lev!==L;
-  document.getElementById('exp').innerHTML=`<span class=up>연 +${b.cagr_b}%</span> <span style="font-size:15px;color:var(--t3)">검증 구간 · ${b.lev}배</span>`;
-  document.getElementById('expsub').innerHTML=`최대 낙폭 <b class=down>${b.mdd}%</b> · 탐색 연 +${b.cagr_a}% · 누적 +${f(b.total)}% · 승률 ${b.win}% · ${b.trades}회 · 최악 거래 ${b.worst}%<br>`
-    +`1배였다면 누적 +${b.lev1.total}% / MDD ${b.lev1.mdd}% · BTC 그냥 보유 +${b.hodl}% / MDD ${b.hodl_mdd}% · ${b.from}~${b.to}`
-    +(stale?`<br><b class=down>지금 설정은 ${L}배 — 위 수치는 ${b.lev}배 기준입니다. make current 로 재측정하세요</b>`:'');
+  document.getElementById('exp').innerHTML=`<span class=up>연 +${b.cagr}%</span> <span style="font-size:15px;color:var(--t3)">${b.src} · ${b.lev}배</span>`;
+  document.getElementById('expsub').innerHTML=`최대 낙폭 <b class=down>${b.mdd}%</b> · 승률 ${b.win}% · ${b.trades}회 · 거래당 +${b.per_trade}%<br>`
+    +b.more.map(([n,c,m])=>`${n} 연 +${c}% / MDD ${m}%`).join(' · ')
+    +(stale?`<br><b class=down>지금 설정은 ${L}배 — 위 수치는 ${b.lev}배 기준입니다 (research/aoa/dip_lev2.py 로 재측정)</b>`:'');
   const ac=document.getElementById('acct');
   if(a){
     ac.style.display='';
@@ -259,15 +275,15 @@ async function load(){
     }
   }else ac.style.display='none';
   const pos=st.side?`<span class="${st.side==='long'?'up':'down'}">${Z[st.side]}</span> ${f(st.qty,6)} ${s.coin}`:'없음';
-  const held=st.entered_at?Math.floor((Date.now()-new Date(st.entered_at))/864e5)+'일째':'현금 대기';
-  const stats=[['모의 장부 포지션',pos,held],['모의 장부 진입가',st.side?f(st.entry,1):'-',''],
-    ...(st.watch_bar?[['진입 대기 (하한 방어)',`하한 ${f(st.watch_hi,0)} 확인 중`,`4h 돌파봉 ${st.watch_bar} · 분봉이 이 선을 지키거나 되찾으면 매수, 다음 4h 봉까지 못 지키면 자리 포기`]]:[]),
+  const held=st.entered_at?Math.floor((Date.now()-new Date(st.entered_at))/36e5)+'시간째':'현금 대기', R=s.rule;
+  const stats=[['모의 장부 포지션',pos,held],['모의 장부 진입가',st.side?f(st.entry,1):'-',
+      st.side?`익절 ${f(st.entry*(1+R.TP/100),0)} · 손절 ${f(st.entry*(1-R.SL/100),0)} · 최대 ${R.hours}시간`:''],
     ['마지막 판단',when(l.timestamp),l.action?ACT[l.action]:''],
     ['다음 판단',s.autorun?(s.next_run?when(s.next_run)+' 자동':'준비 중'):'자동실행 OFF',s.autorun?s.interval_min+'분마다':'make on 또는 버튼으로 켜기']];
   document.getElementById('stats').innerHTML=stats.map(([k,v,d])=>`<div class=stat><div class=label>${k}</div><div class=v>${v}</div>${d?`<div class=label style="margin:4px 0 0">${d}</div>`:''}</div>`).join('');
   document.getElementById('runs').innerHTML=s.runs.length?s.runs.slice().reverse().map(r=>{
     const err=r.status!=='done', cls=err?'err':(r.action==='hold'?'hold':r.zone);
-    return `<div class=row><div class="ic ${cls}">${err?'!':Z[r.zone]||'-'}</div><div class=m><b>${err?'실패':ACT[r.action]||r.action||'-'}${r.position?' · '+Z[r.position]+' 보유 중':''}</b><span>${err?r.status:r.reason||''}</span></div><div class=r><b>${r.bull!=null?'강세 '+r.bull+'/8':'-'}</b><span>${when(r.timestamp)} · ${r.mode}</span></div></div>`}).join(''):'<div class=empty>아직 판단 기록이 없습니다</div>';
+    return `<div class=row><div class="ic ${cls}">${err?'!':Z[r.zone]||'-'}</div><div class=m><b>${err?'실패':ACT[r.action]||r.action||'-'}${r.position?' · '+Z[r.position]+' 보유 중':''}</b><span>${err?r.status:r.reason||''}</span></div><div class=r><b>${r.p!=null?(r.p>0?'+':'')+f(r.p,2)+'%':'-'}</b><span>${when(r.timestamp)} · ${r.mode}</span></div></div>`}).join(''):'<div class=empty>아직 판단 기록이 없습니다</div>';
   document.getElementById('orders').innerHTML=s.orders.length?s.orders.map(o=>{
     const ok=o.status==='paper'||o.status==='submitted';
     return `<div class=row><div class="ic ${ok?o.side:'err'}">${Z[o.side]}</div><div class=m><b>${ACT[o.action]} · ${o.mode==='live'?tag:o.mode==='demo'?'OKX 데모':'모의 장부'}</b><span>${o.reason||''}</span></div><div class=r><b>${f(o.notional,2)} USDT</b><span>${f(o.qty,6)} ${s.coin} @ ${f(o.price,1)} · ${ok?'체결':o.status}</span></div></div>`}).join(''):'<div class=empty>아직 주문이 없습니다</div>';
@@ -306,7 +322,7 @@ async function run(){const b=document.getElementById('runbtn');b.disabled=true;b
 async function analysis(){
   const a=await (await fetch('/api/analysis')).json(), st=window._state||{}, l=st.last||{};
   document.getElementById('price').textContent=f(a.price,1)+' USDT';
-  document.getElementById('chartnote').textContent=`최근 60일 · 마지막은 진행 중인 오늘 봉 · 신호 기준봉 ${a.date}`;
+  document.getElementById('chartnote').textContent=`최근 60일 · 선: 50일선(주황)·200일선(보라) · 마지막은 진행 중인 오늘 봉`;
   const buys=Object.fromEntries(a.orders.filter(o=>o.action==='open').map(o=>[o.timestamp.slice(0,10),o.price]));
   const sells=Object.fromEntries(a.orders.filter(o=>o.action==='close').map(o=>[o.timestamp.slice(0,10),o.price]));
   // 오늘 봉(진행 중) 상세. 봉 경계 09:00 KST — PC 시계가 KST 라고 본다
@@ -317,7 +333,7 @@ async function analysis(){
     ['전일 종가 대비',`<span class=${cl(pct(t.c,y.c))}>${sg(pct(t.c,y.c))}</span>`,`어제 종가 ${f(y.c,1)}`],
     ['시가',f(t.o,1),''],['고가',f(t.h,1),`시가 대비 ${sg(pct(t.h,t.o))}`],['저가',f(t.l,1),`시가 대비 ${sg(pct(t.l,t.o))}`],
     ['변동폭',sg(pct(t.h,t.l)).slice(1),`${f(t.h-t.l,1)} USDT (어제 ${f(pct(y.h,y.l),2)}%)`],
-    ['거래량',f(t.v,0)+' BTC',`어제 ${f(y.v,0)} BTC`],['기준봉 (신호 계산)',y.t.slice(5),`종가 ${f(y.c,1)} · ${sg(pct(y.c,y.o))}`]];
+    ['거래량',f(t.v,0)+' BTC',`어제 ${f(y.v,0)} BTC`],['추세 필터 기준 (전날)',y.t.slice(5),`종가 ${f(y.c,1)} · 50일선 ${f(y.m50,0)} · 200일선 ${f(y.m200,0)}`]];
   document.getElementById('today').innerHTML=td.map(([k,v,d])=>`<div class=stat><div class=label>${k}</div><div class=v>${v}</div>${d?`<div class=label style="margin:4px 0 0">${d}</div>`:''}</div>`).join('');
   // 캔들: Chart.js 플로팅 바 두 겹 (심지 [저,고] + 몸통 [시,종]). 마지막 봉은 진행 중
   const cs60=cs.slice(-60), col=c=>c.c>=c.o?'#f04452':'#3182f6';
@@ -325,24 +341,22 @@ async function analysis(){
     {type:'bar',data:cs60.map(c=>[c.l,c.h]),backgroundColor:cs60.map(col),barPercentage:.14,categoryPercentage:1,grouped:false,borderWidth:0,order:3},
     {type:'bar',data:cs60.map(c=>[Math.min(c.o,c.c),Math.max(c.o,c.c)]),backgroundColor:cs60.map(col),barPercentage:.72,categoryPercentage:1,grouped:false,borderWidth:0,minBarLength:2,order:2},
     {type:'line',data:cs60.map(c=>buys[c.t]??null),pointStyle:'triangle',pointRadius:9,pointBackgroundColor:'#f04452',pointBorderColor:'#fff',pointBorderWidth:1.5,showLine:false,order:1},
-    {type:'line',data:cs60.map(c=>sells[c.t]??null),pointStyle:'triangle',pointRotation:180,pointRadius:9,pointBackgroundColor:'#3182f6',pointBorderColor:'#fff',pointBorderWidth:1.5,showLine:false,order:1}]};
-  const opt={animation:false,plugins:{legend:{display:false},tooltip:{mode:'index',intersect:false,filter:x=>x.datasetIndex!==0&&x.raw!=null,
+    {type:'line',data:cs60.map(c=>sells[c.t]??null),pointStyle:'triangle',pointRotation:180,pointRadius:9,pointBackgroundColor:'#3182f6',pointBorderColor:'#fff',pointBorderWidth:1.5,showLine:false,order:1},
+    {type:'line',data:cs60.map(c=>c.m50),borderColor:'#f59f00',borderWidth:1.5,pointRadius:0,tension:.2,order:0},
+    {type:'line',data:cs60.map(c=>c.m200),borderColor:'#7048e8',borderWidth:1.5,pointRadius:0,tension:.2,order:0}]};
+  const opt={animation:false,plugins:{legend:{display:false},tooltip:{mode:'index',intersect:false,filter:x=>x.datasetIndex!==0&&x.datasetIndex<4&&x.raw!=null,
       callbacks:{label:x=>{const c=cs60[x.dataIndex];return x.datasetIndex===1?`시 ${f(c.o,1)} · 고 ${f(c.h,1)} · 저 ${f(c.l,1)} · 종 ${f(c.c,1)} (${sg(pct(c.c,c.o))})`:(x.datasetIndex===2?'매수 ':'매도 ')+f(x.raw,1)}}}},
     scales:{x:{grid:{display:false},ticks:{color:'#8b95a1',maxTicksLimit:10}},y:{beginAtZero:false,grace:'3%',grid:{color:'#f2f4f6'},border:{display:false},ticks:{color:'#8b95a1',maxTicksLimit:6,callback:v=>f(v/1e3,1)+'K'}}}};
   if(pchart){pchart.data=data;pchart.update()}else pchart=new Chart(document.getElementById('pchart'),{type:'bar',data,options:opt});
-  const rules=a.rules.map(r=>`<div class="rule ${r.bull?'bull':r.bear?'bear':'none'}"><span>${r.name}</span><em>${r.bull?'롱':r.bear?'숏':'중립'} · ${r.value}</em></div>`).join('');
-  const exits=[a.exit_long?'롱 청산':'',a.exit_short?'숏 청산':''].filter(Boolean).join(' · ');
-  const zoneWhy=a.zone==='long'?`일봉 롱 ${a.bull}≥${a.conf} 이고 4h 종가 ${f(a.close,0)} > 직전 ${a.h4_n}봉 고가 ${f(a.hi,0)} 돌파 → <b>롱 자리 (상승 베팅)</b>`
-    :a.zone==='short'?`일봉 숏 ${a.bear}≥${a.conf} 이고 4h 종가 ${f(a.close,0)} < 직전 ${a.h4_n}봉 저가 ${f(a.lo_n,0)} 이탈 → <b>숏 자리 (하락 베팅)</b>`+(st.allow_short?'':' · <b>ALLOW_SHORT=0 이라 진입하지 않음</b>')
-    :a.bull_regime?`일봉 롱 ${a.bull}≥${a.conf} 롱 국면이지만 4h 돌파 없음 (종가 ${f(a.close,0)} ≤ ${f(a.hi,0)}) → <b>자리 없음</b>`
-    :a.bear_regime?`일봉 숏 ${a.bear}≥${a.conf} 숏 국면이지만 4h 이탈 없음 (종가 ${f(a.close,0)} ≥ ${f(a.lo_n,0)}) → <b>자리 없음</b>`
-    :`국면 없음 (롱 ${a.bull}/8 · 숏 ${a.bear}/8, 둘 다 ${a.conf} 미만) → <b>관망</b>`;
+  const R=a.rule, pos=a.position, dv=(a.dev>0?'+':'')+f(a.dev,2)+'%';
   const steps=[
-    ['일봉 수집',`OKX ${a.candles.length}일봉 중 진행 중인 오늘 봉은 제외 → 기준봉 <b>${a.date}</b> (국면은 09:00 KST 에 갱신)`,''],
-    ['지표 8개 판정 (국면)',`롱 <b>${a.bull}</b>/8 · 숏 <b>${a.bear}</b>/8 (${a.conf}개 이상이면 그 방향 국면 — 롱 국면과 숏 국면은 동시에 성립하지 않는다)<div class=rules>${rules}</div>`,''],
-    ['4h 극단 점수 (평균회귀 지표)',`고점 <b>${a.extreme_hi}</b>/${a.extreme_rules} · 저점 <b>${a.extreme_lo}</b>/${a.extreme_rules} (RSI·볼린저·스토캐스틱·도치안·꼬리·거래량·ATR)${st.extreme_min?`<br>EXTREME_MIN=${st.extreme_min} — 이 점수 미만이면 진입하지 않는다`:'<br>EXTREME_MIN=0 (필터 꺼짐). 참고용 표시'}`,''],
-    ['4h 봉 돌파·이탈',`마지막 완성 4h 봉 <b>${a.bar}</b> 종가 <b>${f(a.close,0)}</b><br>롱 진입선 ${f(a.hi,0)} (직전 ${a.h4_n}봉 고가) · 롱 청산선 ${f(a.lo,0)} (${a.h4_m}봉 저가)<br>숏 진입선 ${f(a.lo_n,0)} (직전 ${a.h4_n}봉 저가) · 숏 청산선 ${f(a.hi_m,0)} (${a.h4_m}봉 고가)<br>다음 봉 마감 ${a.next_bar}, 그 뒤 ${st.interval_min}분 안에 판단${exits?'<br>지금 켜진 청산 조건: <b>'+exits+'</b>':''}`,''],
-    ['자리 결정',zoneWhy,''],
+    ['추세 필터 (일봉)',`전날(${a.date}) 종가 <b>${f(a.prev_close,0)}</b> · 50일선 ${f(a.sma50,0)} · 200일선 ${f(a.sma200,0)} → `
+      +(a.trend_ok?'<b>통과</b> — 급락이 오면 산다':'<b>차단</b> — 둘 다 위가 아니면 급락이 와도 사지 않는다')+' (매일 09:00 KST 갱신)',a.trend_ok?'':'off'],
+    ['급락 확인 (5분봉)',`마지막 완성 5분봉 <b>${a.bar}</b> 종가 <b>${f(a.close,0)}</b> · 1h 이평 ${f(a.ema,0)} · 괴리 <b>${dv}</b><br>`
+      +`진입선 <b>${f(a.trigger_px,0)}</b> (1h 이평 −${R.D}%) — 5분봉 종가가 이 아래로 닫히면 매수 · 다음 봉 마감 ${a.next_bar}, 15초 뒤 판단`,''],
+    ['자리 결정',a.signal?'<b>급락 매수 자리</b> — 다음 판단에서 진입':(a.trend_ok?`괴리 ${dv} > −${R.D}% → 관망`:'추세 차단 → 관망'),a.signal?'act':''],
+    ['포지션 관리',pos?`진입 ${f(pos.entry,1)} → 익절 <b>${f(pos.tp,0)}</b> (+${R.TP}%) / 손절 <b>${f(pos.sl,0)}</b> (−${R.SL}%) / 만기 ${pos.expiry}`
+      :`포지션 없음 · 들어가면 +${R.TP}% 익절 / −${R.SL}% 손절 / 최대 ${R.hours}시간`,pos?'act':'off'],
     ['상태기계',l.reason?`${ACT[l.action]||l.action} — ${l.reason}`:'아직 판단 전',l.action==='open'||l.action==='close'?'act':''],
     ['Claude 검토 (체결 직전)',!st.use_claude?'CLAUDE_BASE_URL 이 비어 있어 생략 — 정량 신호만으로 매매':(l.reason||'').includes('Claude')?l.reason.slice(l.reason.indexOf('Claude')):`실제로 주문을 내기 직전에만 호출 · ${st.claude_model} (OmniRoute) · 알고리즘 값을 캔들과 대조하고 사건·급변이면 거부`,(l.reason||'').includes('Claude 거부')?'act':(l.reason||'').includes('Claude')?'':'off'],
     ['주문',l.action==='open'||l.action==='close'?`${ACT[l.action]} 주문 전송 (아래 주문 목록)`:'없음 (보유 유지 또는 관망)',l.action==='open'||l.action==='close'?'act':'off']];
