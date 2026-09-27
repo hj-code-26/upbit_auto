@@ -16,8 +16,6 @@
   3) 진입은 그 다음이고, **진입한 그 봉 안에서** 체결가 이후의 가격만으로 강제청산을 다시 본다.
      분봉 체결(fills)이면 체결 시각 이후 분봉만 쓴다 — 체결 전 저가는 그 포지션과 무관하기 때문이다.
 
-거래 원장에는 봉 번호(i_in·i_out)와 체결가(px_in·px_out)도 남는다 — test_parity.py 가 봇 재생 결과와 한 줄씩 대조한다.
-
 fills: {진입봉 시각: None | 체결가 | (체결가, 체결 후 저가, 체결 후 고가)}
        None 이면 그 자리를 포기한다. 체결가만 주면 그 봉 전체를 체결 후로 본다 (보수적).
 """
@@ -50,7 +48,7 @@ def liq_level(entry, lev, side):
 
 def run(h4, l_en, l_ex, s_en, s_ex, lev_of, lab=None, allow=("long", "short"),
         fills=None, gate=None, hold_bars=None, pos_pct=1.0):
-    """→ (자본곡선, 거래 DataFrame[side, ret, regime, bars, how, i_in, i_out, px_in, px_out], stats dict)
+    """→ (자본곡선, 거래 DataFrame[side, ret, regime, bars, how], stats dict)
 
     lev_of(i, curve) → 이번 진입의 레버리지 (0 이면 진입하지 않는다).
     gate: None · bool 배열(양방향 공통) · (롱 게이트, 숏 게이트) 튜플.
@@ -69,12 +67,11 @@ def run(h4, l_en, l_ex, s_en, s_ex, lev_of, lab=None, allow=("long", "short"),
         lvl = liq_level(e, lev, side)
         return px <= lvl if side > 0 else px >= lvl
 
-    def blow(side, reg, k, how, i, e, px):
+    def blow(side, reg, k, how):
         nonlocal eq, liq
         eq *= 1 - pos_pct
         liq += 1
-        rows.append({"side": "롱" if side > 0 else "숏", "ret": -1.0, "regime": reg, "bars": k, "how": how,
-                     "i_in": i - k, "i_out": i, "px_in": e, "px_out": px})
+        rows.append({"side": "롱" if side > 0 else "숏", "ret": -1.0, "regime": reg, "bars": k, "how": how})
 
     for i in range(1, n):
         if held:
@@ -84,12 +81,11 @@ def run(h4, l_en, l_ex, s_en, s_ex, lev_of, lab=None, allow=("long", "short"),
             if want_exit and not breached(o[i], e, lev, side):        # 1) 시가 정상 청산이 먼저다
                 r = side * lev * (o[i] / e - 1) - lev * C * (1 + o[i] / e) - side * k * FUND * lev
                 eq *= 1 + r * pos_pct
-                rows.append({"side": "롱" if side > 0 else "숏", "ret": r, "regime": reg, "bars": k, "how": "신호",
-                             "i_in": i - k, "i_out": i, "px_in": e, "px_out": o[i]})
+                rows.append({"side": "롱" if side > 0 else "숏", "ret": r, "regime": reg, "bars": k, "how": "신호"})
                 held = None
             elif want_exit or breached(lo[i] if side > 0 else hi[i], e, lev, side):
                 ambig += bool(want_exit)          # 시가부터 청산선 너머 — 순서 불명, 보수적으로 청산 처리
-                blow(side, reg, k, "청산(시가불명)" if want_exit else "청산", i, e, liq_level(e, lev, side))
+                blow(side, reg, k, "청산(시가불명)" if want_exit else "청산")
                 held = None
             else:
                 held = (e, k, lev, side, reg)
@@ -105,15 +101,14 @@ def run(h4, l_en, l_ex, s_en, s_ex, lev_of, lab=None, allow=("long", "short"),
                 reg = None if lab is None else lab[i - 1]
                 if lev > 0 and px is not None:
                     if breached(lo_a if side > 0 else hi_a, px, lev, side):   # 3) 진입한 그 봉 안에서 터진다
-                        blow(side, reg, 0, "청산(진입봉)", i, px, liq_level(px, lev, side))
+                        blow(side, reg, 0, "청산(진입봉)")
                     else:
                         held = (px, 0, lev, side, reg)
         curve[i] = eq * (1 + held[3] * held[2] * (c[i] / held[0] - 1) * pos_pct) if held else eq
         if eq <= 0:
             curve[i:] = 0.0
             break
-    t = pd.DataFrame(rows) if rows else pd.DataFrame(columns=["side", "ret", "regime", "bars", "how",
-                                                              "i_in", "i_out", "px_in", "px_out"])
+    t = pd.DataFrame(rows) if rows else pd.DataFrame(columns=["side", "ret", "regime", "bars", "how"])
     stats = {"liq": liq, "liq_ambiguous": ambig, "open_at_end": bool(held), "mtm_open": 0.0, "forced_close_ret": None}
     if held:                                    # 마지막 미청산 거래: 평가 손익과 '지금 강제로 닫으면' 성적
         e, k, lev, side, _ = held

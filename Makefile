@@ -4,7 +4,7 @@ SHELL := powershell.exe
 PORT ?= 8000
 PY ?= python
 
-.PHONY: exitconf decomp longtrend lev oi funding hour vt vtwf ensemble run bot view botstop multi stop omni on off once test offline audit sizing keys liquidate reset minutes entry sweep quant both downside rev lat bias current sexit flow learn
+.PHONY: dip dipstatus diptest exitconf decomp longtrend lev oi funding hour vt vtwf ensemble run bot view botstop multi stop omni on off once test offline audit sizing keys liquidate reset minutes entry sweep quant both downside rev lat bias current sexit flow learn
 
 run: stop omni
 	@$(PY) dashboard.py
@@ -17,6 +17,15 @@ view: stop                              # 보기 전용 대시보드 — make bo
 
 botstop:                                # 주문 락(127.0.0.1:8765)을 잡은 프로세스 = 돌고 있는 봇을 끈다
 	@Get-NetTCPConnection -LocalPort 8765 -State Bound -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "kill bot: PID $$($$_.OwningProcess)"; Stop-Process -Id $$_.OwningProcess -Force -ErrorAction SilentlyContinue }; exit 0
+
+dip:                                    # 급락 매수 모의 운용 (BTC · 50·200일선 필터 · 1배, 주문 없음) — research_aoa.txt 8~18절
+	@$(PY) dipbuy.py
+
+dipstatus:                              # 급락 매수 모의 장부 요약
+	@$(PY) dipbuy.py --status
+
+diptest:                                # 재생 = 백테스트 대조 (research/aoa/sma50.py)
+	@$(PY) dipbuy.py --selftest
 
 soxl:                                   # quant_nasq100 SOXL 규칙(밴드 리밸런싱+폭락 게이트) 코인 이식 검증. 결론: REJECT
 	@$(PY) backtest_soxl.py

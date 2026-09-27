@@ -1,0 +1,9 @@
+﻿,0
+episodes,8.0
+obs_sum,0.41212566176360177
+obs_valid,0.06284472972478
+obs_explore,0.34928093203882177
+p_sum_onesided,0.078125
+"P_null(D&E pass, log-approx)",0.25
+P_null(D&E&sum>0),0.25
+largest_episode_share%,58.092944108329846

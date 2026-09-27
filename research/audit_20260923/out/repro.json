@@ -1,0 +1,233 @@
+{
+ "okx_range": [
+  "2021-03-01 00:00:00+00:00",
+  "2026-09-09 08:00:00+00:00",
+  12111
+ ],
+ "fills": {
+  "n": 120,
+  "skipped_none": 3
+ },
+ "engine_head_vs_worktree_identical": {
+  "lev1_buf0": true,
+  "lev1_buf2": true,
+  "lev2_buf0": true,
+  "lev2_buf2": true,
+  "lev3_buf0": true,
+  "lev3_buf2": true,
+  "lev5_buf0": true,
+  "lev5_buf2": true
+ },
+ "buf0_equals_Qframes_baseline": true,
+ "buf0_signal_diff_vs_Qframes": {
+  "entry": 0,
+  "exit": 0
+ },
+ "okx": {
+  "lev1_buf0": {
+   "explore_sh": 1.0393,
+   "valid_sh": 0.8404,
+   "full_sh": 0.9439,
+   "full_cum": 201.76,
+   "mdd": -17.8,
+   "trades": 117,
+   "liq": 0,
+   "final_eq": 3.017572,
+   "open_at_end": false
+  },
+  "lev1_buf1": {
+   "explore_sh": 1.1754,
+   "valid_sh": 0.9049,
+   "full_sh": 1.0455,
+   "full_cum": 239.45,
+   "mdd": -19.01,
+   "trades": 114,
+   "liq": 0,
+   "final_eq": 3.394539,
+   "open_at_end": false
+  },
+  "lev1_buf2": {
+   "explore_sh": 1.2363,
+   "valid_sh": 0.8824,
+   "full_sh": 1.0657,
+   "full_cum": 248.07,
+   "mdd": -19.01,
+   "trades": 113,
+   "liq": 0,
+   "final_eq": 3.480671,
+   "open_at_end": false
+  },
+  "lev1_buf3": {
+   "explore_sh": 1.2363,
+   "valid_sh": 0.8824,
+   "full_sh": 1.0657,
+   "full_cum": 248.07,
+   "mdd": -19.01,
+   "trades": 113,
+   "liq": 0,
+   "final_eq": 3.480671,
+   "open_at_end": false
+  },
+  "lev2_buf0": {
+   "explore_sh": 1.0062,
+   "valid_sh": 0.831,
+   "full_sh": 0.9217,
+   "full_cum": 578.9,
+   "mdd": -30.99,
+   "trades": 117,
+   "liq": 0,
+   "final_eq": 6.789022,
+   "open_at_end": false
+  },
+  "lev2_buf1": {
+   "explore_sh": 1.1771,
+   "valid_sh": 0.9063,
+   "full_sh": 1.0457,
+   "full_cum": 755.87,
+   "mdd": -32.49,
+   "trades": 114,
+   "liq": 0,
+   "final_eq": 8.558706,
+   "open_at_end": false
+  },
+  "lev2_buf2": {
+   "explore_sh": 1.2536,
+   "valid_sh": 0.8789,
+   "full_sh": 1.0704,
+   "full_cum": 798.2,
+   "mdd": -32.49,
+   "trades": 113,
+   "liq": 0,
+   "final_eq": 8.982044,
+   "open_at_end": false
+  },
+  "lev2_buf3": {
+   "explore_sh": 1.2536,
+   "valid_sh": 0.8789,
+   "full_sh": 1.0704,
+   "full_cum": 798.2,
+   "mdd": -32.49,
+   "trades": 113,
+   "liq": 0,
+   "final_eq": 8.982044,
+   "open_at_end": false
+  },
+  "lev3_buf0": {
+   "explore_sh": 0.9411,
+   "valid_sh": 0.7989,
+   "full_sh": 0.8724,
+   "full_cum": 1104.64,
+   "mdd": -43.33,
+   "trades": 117,
+   "liq": 0,
+   "final_eq": 12.046395,
+   "open_at_end": false
+  },
+  "lev3_buf1": {
+   "explore_sh": 1.1425,
+   "valid_sh": 0.883,
+   "full_sh": 1.0157,
+   "full_cum": 1596.4,
+   "mdd": -43.99,
+   "trades": 114,
+   "liq": 0,
+   "final_eq": 16.964017,
+   "open_at_end": false
+  },
+  "lev3_buf2": {
+   "explore_sh": 1.2329,
+   "valid_sh": 0.8512,
+   "full_sh": 1.0443,
+   "full_cum": 1719.03,
+   "mdd": -42.86,
+   "trades": 113,
+   "liq": 0,
+   "final_eq": 18.190347,
+   "open_at_end": false
+  },
+  "lev3_buf3": {
+   "explore_sh": 1.2329,
+   "valid_sh": 0.8512,
+   "full_sh": 1.0443,
+   "full_cum": 1719.03,
+   "mdd": -42.86,
+   "trades": 113,
+   "liq": 0,
+   "final_eq": 18.190347,
+   "open_at_end": false
+  },
+  "lev5_buf0": {
+   "explore_sh": 0.7387,
+   "valid_sh": 0.6858,
+   "full_sh": 0.7133,
+   "full_cum": 2018.44,
+   "mdd": -62.77,
+   "trades": 117,
+   "liq": 0,
+   "final_eq": 21.184368,
+   "open_at_end": false
+  },
+  "lev5_buf1": {
+   "explore_sh": 0.9805,
+   "valid_sh": 0.7799,
+   "full_sh": 0.882,
+   "full_cum": 3592.99,
+   "mdd": -63.48,
+   "trades": 114,
+   "liq": 0,
+   "final_eq": 36.929946,
+   "open_at_end": false
+  },
+  "lev5_buf2": {
+   "explore_sh": 1.0892,
+   "valid_sh": 0.7415,
+   "full_sh": 0.9153,
+   "full_cum": 4014.91,
+   "mdd": -58.24,
+   "trades": 113,
+   "liq": 0,
+   "final_eq": 41.149118,
+   "open_at_end": false
+  },
+  "lev5_buf3": {
+   "explore_sh": 1.0892,
+   "valid_sh": 0.7415,
+   "full_sh": 0.9153,
+   "full_cum": 4014.91,
+   "mdd": -58.24,
+   "trades": 113,
+   "liq": 0,
+   "final_eq": 41.149118,
+   "open_at_end": false
+  }
+ },
+ "bitstamp_range": [
+  "2016-01-01 00:00:00+00:00",
+  "2026-09-10 00:00:00+00:00",
+  23431
+ ],
+ "bitstamp": {
+  "buf0": {
+   "sh": 1.3019,
+   "cum": 5176.8,
+   "trades": 255
+  },
+  "buf1": {
+   "sh": 1.341,
+   "cum": 5818.2,
+   "trades": 252
+  },
+  "buf2": {
+   "sh": 1.3424,
+   "cum": 5875.9,
+   "trades": 251
+  },
+  "buf3": {
+   "sh": 1.3486,
+   "cum": 5971.6,
+   "trades": 250
+  }
+ },
+ "cost_one_way": 0.0007,
+ "conf": 6
+}

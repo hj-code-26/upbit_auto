@@ -7,3 +7,5 @@ __pycache__/
 data_cache/
 model.pkl
 autorun.off
+COIN_CHANGE/
+.serena/

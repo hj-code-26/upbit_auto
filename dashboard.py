@@ -17,9 +17,24 @@ from fastapi.responses import HTMLResponse, JSONResponse
 import autotrade as A
 
 app = FastAPI()
-# research_bot_rules.txt ① 현재 봇 규칙, BTC 1배 현물, 2023-01-06~2026-09-04 (1338일). 대시보드 '장기 기대 수익률' 근거
-BACKTEST = {"from": "2021-03-01", "to": "2026-09-06", "years": 2016 / 365, "bot": 117, "bot_mdd": -20.9, "trades": 85,
-            "win": 36, "days_in": 299, "days": 2016, "hodl": 62, "hodl_mdd": -76.7}   # research_okx_short.txt (OKX 실제 봉)
+BOT_HERE = False          # 이 프로세스가 주문 락을 잡고 스케줄러를 돌리는가 (__main__ 에서 정한다)
+
+
+def next_run(last_ts):
+    """다음 판단 시각. 스케줄러가 이 프로세스에 없으면(터미널 봇) 마지막 판단 + 간격으로 추정한다."""
+    if A.NEXT_RUN:
+        return A.NEXT_RUN.isoformat()
+    if not last_ts:
+        return None
+    return (A.dt.datetime.fromisoformat(last_ts) + A.dt.timedelta(minutes=A.INTERVAL_MIN)).isoformat()
+
+
+# '장기 기대 수익률' 근거 = `make current` (backtest_current.py, 2026-09-10 감사 후 엔진) 의 [지금 이 봇] 줄.
+# 예전 값(1배 +117% × 레버리지 단리 근사)은 수정 전 엔진이었고 5배를 곱하면 MDD 가 −105% 로 나오는 등 틀렸다.
+# 이 레버리지와 .env LEVERAGE 가 다르면 화면에 '재측정 필요' 가 뜬다.
+BACKTEST = {"from": "2021-03-01", "to": "2026-09-09", "lev": 5, "vt": 0, "total": 2018, "cagr_a": 79, "cagr_b": 68,
+            "mdd": -62.8, "sharpe": 0.71, "trades": 117, "win": 36, "worst": -29.1,
+            "lev1": {"total": 202, "mdd": -17.8}, "hodl": 60, "hodl_mdd": -76.7}
 
 
 def rows(sql):
@@ -48,7 +63,7 @@ def api_state():
             "paper_done": A.paper_trades_done(), "live_after": A.LIVE_AFTER, "autorun": A.autorun(),
             "use_claude": A.USE_CLAUDE, "claude_model": A.CLAUDE_MODEL, "backtest": BACKTEST,
             "real_first": next((r["real_equity"] for r in rows("SELECT real_equity FROM runs WHERE real_equity > 0 ORDER BY id LIMIT 1")), None),
-            "interval_min": A.INTERVAL_MIN, "next_run": A.NEXT_RUN.isoformat() if A.NEXT_RUN else None, "min_order": A.X.MIN_ORDER,
+            "interval_min": A.INTERVAL_MIN, "next_run": next_run(runs[0]["timestamp"] if runs else None), "bot_here": BOT_HERE, "min_order": A.X.MIN_ORDER,
             "state": A.state(), "last": runs[0] if runs else None,
             "account": live_account(),
             "demo_keys": A.X.have_keys(True), "demo_account": live_account(True) if A.X.have_keys(True) and not A.X.DEMO else None,
@@ -70,6 +85,8 @@ def api_analysis():
 
 @app.post("/api/run")
 def api_run():
+    if not BOT_HERE:
+        return JSONResponse({"ok": False, "error": "봇이 다른 프로세스(터미널 make bot 등)에서 돌고 있습니다 — 판단은 그쪽 스케줄러가 합니다"}, status_code=409)
     threading.Thread(target=A.run_cycle, args=("버튼",), daemon=True).start()
     return {"ok": True}
 
@@ -83,6 +100,8 @@ def api_autorun(body: dict):
 @app.post("/api/order")
 def api_order(body: dict):
     """수동 주문. body = {"action": "buy"|"sell", "confirm": "실주문", "demo": true|false}"""
+    if not BOT_HERE:
+        return JSONResponse({"ok": False, "error": "봇이 다른 프로세스(터미널 make bot 등)에서 돌고 있습니다 — 수동 주문은 봇을 멈춘 뒤 대시보드 단독으로"}, status_code=409)
     if body.get("confirm") != "실주문":
         return JSONResponse({"ok": False, "error": "확인 문구가 다릅니다"}, status_code=400)
     if body.get("action") not in ("buy", "sell"):
@@ -188,6 +207,7 @@ async function load(){
   else{md.className='pill';md.innerHTML='<i></i>'+(s.mode==='auto'&&s.have_keys?`모의 장부 ${s.paper_done}/${s.live_after} · 완료 후 ${tag}`:'모의 장부'+(s.have_keys&&!s.demo?' · 실계좌는 잔고만 읽음':''))}
   document.getElementById('lev').textContent=(s.lev_now&&s.lev_now[1]?`${s.lev_now[0].toFixed(2)}배 (상한 ${s.leverage}) · ${Math.round(s.position_pct*100)}%`:`${s.leverage}배 · ${Math.round(s.position_pct*100)}%`);
   document.getElementById('lev').title=s.lev_now?s.lev_now[1]:'';
+  const rb=document.getElementById('runbtn');if(!s.bot_here){rb.disabled=true;rb.textContent='다른 곳에서 봇 실행 중';rb.title='판단·주문은 터미널(make bot)이 한다 · 이 화면은 보기 전용'}
   const ab=document.getElementById('autobtn');ab.className=s.autorun?'btn':'btn off';ab.textContent=s.autorun?'자동실행 ON':'자동실행 OFF';
   document.getElementById('price').textContent=l.price?f(l.price,1)+' USDT':'-';
   document.getElementById('signal').innerHTML=l.zone?`<span class="zone ${l.zone}">${Z[l.zone]}</span>&nbsp; 일봉 롱 ${l.bull}/8 · 숏 ${l.bear}/8`:'아직 판단 전';
@@ -211,9 +231,11 @@ async function load(){
   if(base&&cur!=null){const d=cur-base,pc=d/base*100;rt.innerHTML=`<span class="${pc>0?'up':pc<0?'down':'flat'}">${pc>0?'+':''}${f(pc,2)}%</span>`;
     document.getElementById('retsub').textContent=`${d>0?'+':''}${f(d,2)} USDT · 시작 ${f(base,2)} → 현재 ${f(cur,2)}`+(live&&a.position?' · 미실현 포함':'')}
   else{rt.textContent='-';document.getElementById('retsub').textContent='첫 판단 기록 뒤 표시됩니다'}
-  const b=s.backtest, yr=x=>(Math.pow(1+x/100,1/b.years)-1)*100, L=s.leverage;
-  document.getElementById('exp').innerHTML=`<span class=up>연 +${f(yr(b.bot)*L,1)}%</span> <span style="font-size:15px;color:var(--t3)">${L}배 근사</span>`;
-  document.getElementById('expsub').innerHTML=`1배: 연 +${f(yr(b.bot),1)}% (누적 +${b.bot}%, MDD ${b.bot_mdd}%, 승률 ${b.win}% · ${b.trades}회) · ${L}배는 단리 근사, MDD ≈ ${f(b.bot_mdd*L,0)}% (청산·펀딩비 미반영)<br>비교 BTC 그냥 보유: 연 +${f(yr(b.hodl),1)}% (MDD ${b.hodl_mdd}%) · 검증 ${b.from}~${b.to}, 시장 진입 ${b.days_in}/${b.days}일`;
+  const b=s.backtest, L=s.leverage, stale=b.lev!==L;
+  document.getElementById('exp').innerHTML=`<span class=up>연 +${b.cagr_b}%</span> <span style="font-size:15px;color:var(--t3)">검증 구간 · ${b.lev}배</span>`;
+  document.getElementById('expsub').innerHTML=`최대 낙폭 <b class=down>${b.mdd}%</b> · 탐색 연 +${b.cagr_a}% · 누적 +${f(b.total)}% · 승률 ${b.win}% · ${b.trades}회 · 최악 거래 ${b.worst}%<br>`
+    +`1배였다면 누적 +${b.lev1.total}% / MDD ${b.lev1.mdd}% · BTC 그냥 보유 +${b.hodl}% / MDD ${b.hodl_mdd}% · ${b.from}~${b.to}`
+    +(stale?`<br><b class=down>지금 설정은 ${L}배 — 위 수치는 ${b.lev}배 기준입니다. make current 로 재측정하세요</b>`:'');
   const ac=document.getElementById('acct');
   if(a){
     ac.style.display='';
@@ -229,8 +251,8 @@ async function load(){
         ['평가손익',p?(p.pnl>0?'+':'')+f(p.pnl,2)+' USDT':'-',p&&p.entry?`${(p.pnl/(p.entry*p.qty)*100).toFixed(2)}%`:'']];
       document.getElementById('acctgrid').innerHTML=g.map(([k,v,d])=>`<div class=stat><div class=label>${k}</div><div class=v>${v}</div>${d?`<div class=label style="margin:4px 0 0">${d}</div>`:''}</div>`).join('');
       const paper=s.mode==='paper';
-      document.getElementById('buybtn').disabled=paper||!!p||a.cash*s.leverage<s.min_order;
-      document.getElementById('sellbtn').disabled=paper||!p;
+      document.getElementById('buybtn').disabled=!s.bot_here||paper||!!p||a.cash*s.leverage<s.min_order;
+      document.getElementById('sellbtn').disabled=!s.bot_here||paper||!p;
       document.getElementById('accttitle').textContent=s.demo?'OKX 데모 계좌':'OKX 실계좌';
       document.getElementById('acctnote').textContent=(paper?'MODE=paper 라 실주문이 잠겨 있습니다':(s.demo?'모의투자 서버 · 가짜 돈':'진짜 돈'))+demoNote(s);
       demoBtns(s);
@@ -265,7 +287,7 @@ function demoNote(s){
   return !s.demo_keys?' · 데모 키 없음 (.env 의 OKX_DEMO_API_KEY)':d?(d.error?' · 데모 조회 실패':` · 데모 계좌 ${f(d.equity,2)} USDT · 포지션 ${d.position?Z[d.position.side]+' '+f(d.position.qty,6):'없음'}`):'';
 }
 function demoBtns(s){
-  const d=s.demo_account, on=s.demo_keys&&!s.demo&&d&&!d.error;
+  const d=s.demo_account, on=s.bot_here&&s.demo_keys&&!s.demo&&d&&!d.error;
   document.getElementById('dbuybtn').disabled=!on||!!(d&&d.position);
   document.getElementById('dsellbtn').disabled=!on||!(d&&d.position);
 }
@@ -280,7 +302,7 @@ async function order(action,demo){
   toast(r.ok?`${name} 주문을 보냈습니다 (${f(r.price,1)} USDT)`:`주문 실패: ${r.error}`);
   setTimeout(load,2000);
 }
-async function run(){const b=document.getElementById('runbtn');b.disabled=true;b.textContent='판단 중…';await fetch('/api/run',{method:'POST'});toast('판단을 시작했어요. 잠시 뒤 갱신됩니다');setTimeout(()=>{load();b.disabled=false;b.textContent='지금 판단하기'},15000)}
+async function run(){const b=document.getElementById('runbtn');b.disabled=true;b.textContent='판단 중…';const r=await (await fetch('/api/run',{method:'POST'})).json();if(!r.ok){toast(r.error);return load()}toast('판단을 시작했어요. 잠시 뒤 갱신됩니다');setTimeout(()=>{load();b.disabled=false;b.textContent='지금 판단하기'},15000)}
 async function analysis(){
   const a=await (await fetch('/api/analysis')).json(), st=window._state||{}, l=st.last||{};
   document.getElementById('price').textContent=f(a.price,1)+' USDT';
@@ -337,10 +359,14 @@ def index():
 
 
 if __name__ == "__main__":
-    A.confirm_live()                                   # autotrade.py 와 같은 '실주문' 확인
-    threading.Thread(target=A.schedule_forever, daemon=True).start()
-    A.log.info("스케줄러 시작 — %d분마다 · 자동실행 %s · %s · %g배", A.INTERVAL_MIN, "ON" if A.autorun() else "OFF",
-               "OKX 데모" if A.X.DEMO else "OKX 실계좌", A.LEVERAGE)
+    BOT_HERE = A.single_instance()                     # 터미널 봇(make bot)이 이미 락을 잡았으면 보기 전용으로 뜬다
+    if BOT_HERE:
+        A.confirm_live()                               # autotrade.py 와 같은 '실주문' 확인
+        threading.Thread(target=A.schedule_forever, daemon=True).start()
+        A.log.info("스케줄러 시작 — %d분마다 · 자동실행 %s · %s · %g배", A.INTERVAL_MIN, "ON" if A.autorun() else "OFF",
+                   "OKX 데모" if A.X.DEMO else "OKX 실계좌", A.LEVERAGE)
+    else:
+        A.log.info("봇이 다른 프로세스(터미널 make bot)에서 돌고 있습니다 — 대시보드는 보기 전용 (판단·주문 버튼 잠김)")
     # 인증이 없고 /api/order 가 실주문을 보내므로 이 PC 에서만 접속되게 묶는다.
     # 밖에서 봐야 하면 DASHBOARD_HOST 를 여는 대신 SSH 터널을 써라.
     uvicorn.run(app, host=os.environ.get("DASHBOARD_HOST", "127.0.0.1"),
