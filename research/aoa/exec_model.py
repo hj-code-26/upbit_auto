@@ -61,9 +61,10 @@ MODELS = [("A", 0.0, "lo"), ("B", 0.0, "lo"), ("C-lo s0", 0.0, "lo"), ("C-lo s0.
           ("C-lo s0.3", 0.003, "lo"), ("C-hi s0", 0.0, "hi")]
 
 
-def trades(c, d1, lo, hi, skip=0):
+def trades(c, d1, lo, hi, skip=0, tp=S.TP):
     """판정 봉이 같은 거래 목록 → 거래마다 각 모델의 (청산가, 보유봉) · 사유 · MAE.
-    skip=1 이면 진입 봉을 건너뛰고 다음 봉부터 판정·만기를 센다 (A2·B2 = 현행 autotrade.entry_bar)."""
+    skip=1 이면 진입 봉을 건너뛰고 다음 봉부터 판정·만기를 센다 (A2·B2 = 현행 autotrade.entry_bar).
+    tp = 익절 % (기본 strategy.TP — research/aoa/tp_sweep.py 가 바꿔 쓴다)."""
     dev, bull = S.indicators(c, d1)
     sig = (dev.values <= -S.D) & bull.values
     o, h, l, idx = c.open.values, c.high.values, c.low.values, c.index
@@ -74,7 +75,7 @@ def trades(c, d1, lo, hi, skip=0):
         k = cand[np.searchsorted(cand, i)] if np.searchsorted(cand, i) < len(cand) else n
         if k >= i1 or k + 1 >= n:
             break
-        e = k + 1; entry = o[e]; up, dn = S.levels(entry)
+        e = k + 1; entry = o[e]; up, dn = entry * (1 + tp / 100), S.levels(entry)[1]
         j = t0 = e + skip
         while j < n:
             if bn[j] - bn[t0] >= S.MAXB:
