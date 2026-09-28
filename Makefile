@@ -4,7 +4,7 @@ SHELL := powershell.exe
 PORT ?= 8000
 PY ?= python
 
-.PHONY: run bot view botstop stop omni on off once test offline keys reset replay
+.PHONY: run bot view botstop stop omni on off once test offline keys reset replay demoprot
 
 run: stop omni
 	@$(PY) dashboard.py
@@ -41,6 +41,9 @@ offline:                                # 거래소 없이 도는 점검만 (상
 
 replay:                                 # 1배/2배 성적표 재측정 (research/aoa/dip_lev2.py, data_cache 필요)
 	@$(PY) research/aoa/dip_lev2.py
+
+demoprot:                               # OKX 데모에서 보호주문(protect.py) 가정 확인 — 데모 키 필요, 0.01계약 롱 2회 (demo_protect.py)
+	@$(PY) demo_protect.py run
 
 keys:
 	@$(PY) okx.py keys

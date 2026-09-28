@@ -89,17 +89,17 @@ def candles(ex, count=100, tf="1d"):
 
 def bars_since(ex, since, tf="5m"):
     """since(UTC) 이후 봉 전부 — UTC 인덱스, 마지막 행은 진행 중일 수 있다. OKX 는 since 조회를 100개씩 준다.
-    봇이 꺼져 있던 동안의 봉까지 따라잡을 때 쓴다 (candles() 는 최근 N개뿐)."""
-    rows, t = [], int(since.timestamp() * 1000)
-    while True:
-        r = ex.fetch_ohlcv(SYMBOL, tf, since=t, limit=100)
-        rows += r
-        if len(r) < 100:
-            break
-        t = r[-1][0] + 1
+    봇이 꺼져 있던 동안의 봉까지 따라잡을 때 쓴다 (candles() 는 최근 N개뿐).
+    ccxt 는 since 조회를 [since, since+100봉) 창 하나로 보낸다. 창 안에 결측이 있으면 100개가 안 와도 뒤에 봉이 있으므로
+    '100개 미만이면 끝' 으로 멈추지 않고 창 단위로 지금까지 넘긴다 (2026-09-28 감사: 결측 창에서 조회가 끊겨 낡은 봉을 최신으로 봤다)."""
+    step = int(pd.Timedelta(tf).total_seconds() * 1000) * 100
+    rows, t, end = [], int(since.timestamp() * 1000), int(pd.Timestamp.now(tz="UTC").timestamp() * 1000)
+    while t <= end:
+        rows += ex.fetch_ohlcv(SYMBOL, tf, since=t, limit=100)
+        t += step
     df = pd.DataFrame(rows, columns=["timestamp", "open", "high", "low", "close", "volume"]).drop_duplicates("timestamp")
     df.index = pd.to_datetime(df.timestamp, unit="ms", utc=True)
-    return df.drop(columns="timestamp").astype(float)
+    return df.drop(columns="timestamp").astype(float).sort_index()
 
 
 def price(ex):

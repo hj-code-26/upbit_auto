@@ -178,12 +178,12 @@ def account(ex, px):
             set_state(side=None, qty=0, entry=0, entered_at=None)
             st, paper_pos = state(), None
     else:
-        eq, pos = paper_eq, paper_pos
+        eq, pos, snap = paper_eq, paper_pos, {"cash": st["cash"]}
     if pos:
         pos["entered_at"] = st["entered_at"]
         pos["held_days"] = (dt.datetime.now(KST) - dt.datetime.fromisoformat(st["entered_at"])).days
         pos["pnl_pct"] = pos["pnl"] / eq * 100 if eq else 0.0
-    return {"equity": eq, "pos": pos, "paper_equity": paper_eq, "paper_pos": paper_pos}
+    return {"equity": eq, "pos": pos, "paper_equity": paper_eq, "paper_pos": paper_pos, "cash": snap["cash"]}
 
 
 def liquidated(pos):
@@ -286,6 +286,34 @@ def _order_done(oid, **kw):
         c.execute(f"UPDATE orders SET {', '.join(f'{k}=?' for k in kw)} WHERE id=?", [*kw.values(), oid])
 
 
+PENDING_TTL = pd.Timedelta("30min")   # ponytail: 시장가는 몇 초면 결론이 난다. 이만큼 지나도 거래소가 모르면 '안 나간 주문' 으로 본다
+                                      # (조회 자체가 30분 내내 실패하는 경우와는 못 가른다 — 그때도 account() 대사가 2차 방어선)
+
+
+def unresolved_orders(ex):
+    """결론이 안 난 실주문(intent · submitted · unknown)을 clOrdId 로 다시 조회해 기록을 확정하고, 아직 모르는 건수를 돌려준다.
+    0 이 아니면 신규 진입을 막는다 — 접수만 되고 안 보이던 주문이 뒤늦게 체결되면 포지션이 2배가 된다 (2026-09-28 감사 7b).
+    장부는 건드리지 않는다: 체결된 포지션은 다음 account() 대사가 거래소 값으로 흡수한다."""
+    since = (dt.datetime.now(KST) - dt.timedelta(days=1)).isoformat(timespec="seconds")   # 옛 기록은 다시 쓰지 않는다
+    with db() as c:
+        rows = c.execute("SELECT id, client_id, timestamp FROM orders WHERE mode='live' AND client_id IS NOT NULL AND timestamp > ? "
+                         "AND (status IN ('intent', 'submitted') OR status LIKE 'unknown%')", (since,)).fetchall()
+    left = 0
+    for oid, cid, ts in rows:
+        got = X.find_order(ex, cid)
+        if got and got["filled"] > 0:
+            _order_done(oid, status="filled(대사)" if got["status"] == "closed" else "partial(대사)",
+                        order_id=got["id"], filled_qty=got["filled"], fill_price=got["avg"] or None)
+        elif got and got["status"] == "canceled":
+            _order_done(oid, status="rejected(대사)", order_id=got["id"])
+        elif pd.Timestamp.now(tz=KST) - pd.Timestamp(ts) > PENDING_TTL:
+            _order_done(oid, status="notfound(대사)")
+            log.critical("주문 %s 이 %s 지나도 거래소에 없습니다 — 안 나간 주문으로 보고 진입 차단을 풉니다", cid, PENDING_TTL)
+        else:
+            left += 1
+    return left
+
+
 def execute(ex, run_id, action, side, qty, notional, px, reason, demo=False, lev=None):
     """action: open|close. → 성공 여부 (True 면 장부·거래소가 같은 상태라고 확인된 것).
 
@@ -317,6 +345,8 @@ def execute(ex, run_id, action, side, qty, notional, px, reason, demo=False, lev
             if got and got["filled"] > 0:
                 fill_qty, fill_px = got["filled"], got["avg"] or px
                 status = "filled" if got["status"] == "closed" else "partial"
+            elif got and got["status"] == "canceled":
+                status = "rejected"                        # 거래소가 체결 0 으로 취소·거부했다 — 성공이 아니다 (2026-09-28 감사)
             else:
                 status = "submitted"                       # 조회가 아직 안 잡힌다 → 다음 사이클 대사에 맡긴다
         except Exception as e:                             # noqa: BLE001
@@ -330,6 +360,12 @@ def execute(ex, run_id, action, side, qty, notional, px, reason, demo=False, lev
                 log.critical("주문 상태 불명 (%s %s) — 장부를 바꾸지 않습니다. 다음 사이클에서 거래소 상태로 대사합니다: %s",
                              action, side, X.explain(e))
                 return False
+    if status == "rejected" or (action == "close" and status in ("partial", "submitted")):
+        # 청산은 거래소가 전량 체결을 확인해 줄 때만 장부에서 지운다. 남은 포지션은 다음 사이클 account() 가
+        # 거래소 수량으로 맞추고 act() 가 같은 봉부터 다시 청산한다 (2026-09-28 감사: 부분·미확인 청산을 완료로 적었다).
+        _order_done(oid, status=status, order_id=ex_id, filled_qty=fill_qty if status == "partial" else 0, fill_price=fill_px)
+        log.critical("주문 미완료 (%s %s · %s) — 장부를 바꾸지 않고 다음 사이클에 거래소 상태로 대사합니다", action, side, status)
+        return False
     if not demo:                                           # 체결을 확인한 **뒤에** 장부를 확정한다
         st, fee = state(), (fill_qty or 0) * fill_px * X.TAKER_FEE
         if action == "open":
@@ -347,17 +383,22 @@ def execute(ex, run_id, action, side, qty, notional, px, reason, demo=False, lev
 
 # ---------- 판단 · 주문 ----------
 def entry_bar(entered_at):
-    """진입 시각(KST ISO) → 진입한 5분봉 (UTC). 백테스트의 '진입 = 그 봉 시가' 에 대응한다."""
-    return pd.Timestamp(entered_at).tz_convert("UTC").floor(S.BAR)
+    """진입 시각(KST ISO) → 진입 뒤 첫 **온전한** 5분봉 (UTC). 익절·손절·만기는 이 봉부터 센다.
+    봇은 봉 마감 15초(+Claude 검토) 뒤에 사므로, 진입한 봉의 고가·저가에는 진입 전 가격이 섞여 있어
+    그 봉으로 판정하면 가짜 익절·손절이 나온다 (2026-09-28 감사 2b, (a)안). 백테스트('진입 = 그 봉 시가')보다
+    판정이 최대 한 봉 늦고 만기도 그만큼 늦다 — 진입 직후 5분 안의 터치는 다음 봉부터 본다."""
+    return pd.Timestamp(entered_at).tz_convert("UTC").ceil(S.BAR)
 
 
-def act(ex, pub, run_id, c5, d1, px, acc):
+def act(ex, pub, run_id, c5, d1, px, acc, fresh=True):
     """지난 사이클 이후 완성 봉으로 청산 확인 → 무포지션이면 마지막 봉 신호 → Claude 검토 → 주문.
+    fresh=False (마지막 완성 봉이 지금 기대하는 봉이 아니다 = 데이터 지연) 면 신규 진입만 막는다.
     → (action, reason, claude 결과|None, 마지막 봉 괴리 %, 추세 통과 여부)"""
     dev, bull = S.indicators(c5, d1)
     t, st, pos = c5.index[-1], state(), acc["pos"]
     seen = pd.Timestamp(st["seen_bar"]) if st["seen_bar"] else t - S.BAR      # 첫 실행: 마지막 봉만 본다
-    action, v = "hold", None
+    action, v, retry = "hold", None, False
+    pending = unresolved_orders(ex) if ex else 0                  # 실주문이면 매 사이클 미확정 주문 기록을 거래소로 확정
     notional = acc["equity"] * POSITION_PCT * LEVERAGE * (1 - CASH_RESERVE)
     line = (f"5분봉 {t.tz_convert(KST):%H:%M} 종가 {c5.close.iloc[-1]:,.0f} · 1h EMA 대비 {dev.iloc[-1]:+.2f}% "
             f"(진입 ≤ −{S.D:g}%) · 전날 종가 50·200일선 {'위' if bull.iloc[-1] else '아래'}")
@@ -375,18 +416,24 @@ def act(ex, pub, run_id, c5, d1, px, acc):
         if hit:
             fill = px if ex else hit[0]          # 모의: 백테스트처럼 익절·손절가 체결 / 실주문: 시장가 (최대 5분 늦다)
             reason = f"{hit[1]} — 진입 {pos['entry']:,.1f} → {hit[0]:,.1f} ({bt.tz_convert(KST):%m-%d %H:%M} 봉) → 청산"
-            execute(ex, run_id, "close", "long", pos["qty"], pos["qty"] * fill, fill, reason)
-            action = "close"
+            if execute(ex, run_id, "close", "long", pos["qty"], pos["qty"] * fill, fill, reason):
+                action = "close"
+            else:                                # seen_bar 를 넘기지 않는다 → 다음 사이클이 같은 봉부터 다시 청산 (2026-09-28 감사)
+                retry, reason = True, reason + " · 청산 미확인 — 다음 사이클에 다시 시도"
         else:
             up, dn = S.levels(pos["entry"])
             reason = (f"롱 보유 · 익절 {up:,.0f} / 손절 {dn:,.0f} / 만기 "
                       f"{(t0 + S.MAXB * S.BAR).tz_convert(KST):%m-%d %H:%M} · {line}")
     elif t > seen and S.signal(dev.iloc[-1], bull.iloc[-1]):
-        action, reason = "open", line + " → 급락 매수"
+        action, reason = ("open", line + " → 급락 매수") if fresh else ("hold", line + " → 급락이지만 마지막 봉이 늦게 왔다(데이터 지연) → 사지 않는다")
     else:
         reason = line + " → 관망"
     if action == "open" and entry_blocked():                     # 신규 진입만 막힌 상태 (사고 차단기 · autorun off)
         action, reason = "hold", "신규 진입 차단 중 (entry.off / 자동실행 OFF) — 보호·대사만 한다 · " + reason
+    if action == "open" and pending:                              # 결론 안 난 주문이 있으면 새로 내지 않는다
+        action, reason = "hold", f"결론 안 난 주문 {pending}건 — 거래소에서 확인될 때까지 신규 진입 안 함 · " + reason
+    if action == "open" and ex and notional * (1 / LEVERAGE + X.TAKER_FEE) > acc["cash"]:   # 제출 전 가용 잔고 확인
+        action, reason = "hold", f"가용 {acc['cash']:,.2f} USDT < 증거금+수수료 {notional * (1 / LEVERAGE + X.TAKER_FEE):,.2f} → 제출 안 함 · " + reason
     if action == "open" and USE_CLAUDE:                          # ← 주문 직전. 거부되면 이번 신호는 끝
         v = claude_gate(review_payload(c5, d1, dev.iloc[-1], bull.iloc[-1], px, acc, notional))
         if v["approve"]:
@@ -397,7 +444,8 @@ def act(ex, pub, run_id, c5, d1, px, acc):
         if USE_CLAUDE:                                           # 검토(최대 90초) 사이 움직인 만큼 지금 가격으로 수량을 정한다
             px = X.price(pub)
         execute(ex, run_id, "open", "long", None, notional, px, reason)
-    set_state(seen_bar=t.isoformat())
+    if not retry:
+        set_state(seen_bar=t.isoformat())
     return action, reason, v, float(dev.iloc[-1]), bool(bull.iloc[-1])
 
 
@@ -460,7 +508,8 @@ def _run_cycle(source="자동"):
             else:
                 set_autorun(False)
         else:
-            action, reason, v, dev, trend = act(ex, pub, run_id, c5, d1, px, acc)   # 청산 확인 → 신호 → Claude 검토 → 주문
+            fresh = c5.index[-1] >= utc_now.floor(S.BAR) - S.BAR           # 마지막 완성 봉이 직전 봉인가 (지연 데이터로 진입 금지)
+            action, reason, v, dev, trend = act(ex, pub, run_id, c5, d1, px, acc, fresh)   # 청산 확인 → 신호 → Claude 검토 → 주문
         if action != "hold":
             acc = account(ex, px)
         with db() as c:
