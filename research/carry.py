@@ -67,4 +67,128 @@
    · 판정 ① 의 문턱 4% 가 적당한지 — 결과 보기 전에만 바꿀 수 있다.
 사용: python research/carry.py   (결과 → research/carry_result.txt)   ※ 구현 전 — 이 설계서를 커밋한 뒤 작성한다.
 """
-raise SystemExit("설계서만 있음 — 구현 전")
+import pathlib
+import sys
+
+import numpy as np
+import pandas as pd
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "research" / "aoa"))
+from clone import okx_5m  # noqa: E402
+
+DC = ROOT / "data_cache"
+TAKER_SIDE, MAKER_SIDE = 0.0019, 0.0010      # 한쪽(진입 또는 청산): 현물 0.10 + 선물 0.05 + 미끄러짐 0.02×2 / 지정가 변형
+WIN = {"C0": None, "C1": 21, "C2": 9}
+ON, OFF = 0.08, 0.0                          # 연율 문턱
+
+
+def run(f, rule, lo, hi, side_cost):
+    """→ 회차별 명목 대비 손익 Series · 전환 횟수 · 보유 비율. 판단은 직전 회차까지 확정된 펀딩만 쓴다."""
+    w = WIN[rule]
+    known = (f.rolling(w).mean() * 3 * 365).shift(1) if w else None
+    ev = f[(f.index >= lo) & (f.index < hi)]
+    hold, pnl, sw, held = False, [], 0, 0
+    for t, x in ev.items():
+        want = True if w is None else (True if known[t] >= ON else False if known[t] < OFF else hold)
+        c = 0.0
+        if want != hold:
+            c -= side_cost; sw += 1; hold = want
+        pnl.append(c + (x if hold else 0.0)); held += hold
+    if hold and pnl:
+        pnl[-1] -= side_cost
+    return pd.Series(pnl, index=ev.index, dtype=float), sw, held / max(len(ev), 1)
+
+
+def yrs(lo, hi, f):
+    return (min(hi, f.index[-1]) - max(lo, f.index[0])).days / 365.25
+
+
+def lev_events(px, hold_idx, L):
+    """A 경로 선물 L배: 보유 중 일봉 고가가 기준가 대비 (+0.5/L) 에 닿으면 보충 1회(기준가 갱신),
+    (+1/L − 0.4%) 에 닿으면 '보충 안 했으면 청산' 1회(기준가 갱신)."""
+    top = liq = 0; ref = None
+    for d, (h, c) in px.iterrows():
+        if d not in hold_idx:
+            ref = None; continue
+        ref = c if ref is None else ref
+        if h >= ref * (1 + 1 / L - 0.004):
+            liq += 1
+        if h >= ref * (1 + 0.5 / L):
+            top += 1; ref = h
+    return top, liq
+
+
+if __name__ == "__main__":
+    T = lambda s: pd.Timestamp(s, tz="UTC")  # noqa: E731
+    lines = []
+    P = lambda *a: (print(*a, flush=True), lines.append(" ".join(map(str, a))))  # noqa: E731
+    P(__doc__.split("\n")[0])
+    fb = pd.read_pickle(DC / "binance_funding.pkl").sort_index()
+    fm = pd.read_pickle(DC / "bitmex_funding.pkl").sort_index()
+    fo = pd.read_pickle(DC / "okx_funding.pkl").sort_index()
+    IS, OOS = (T("2019-09-10"), T("2023-01-01")), (T("2023-01-01"), T("2026-10-01"))
+    A1 = lambda x: x / 2  # noqa: E731     A 경로 선물 1배: 자본 = 명목 × 2
+
+    P("\n[1] 탐색 구간 2019-09~2022-12 (바이낸스) — 자본 대비 연 순수익, A 1배 · 테이커")
+    best, isr = None, {}
+    for r in WIN:
+        s, sw, hf = run(fb, r, *IS, TAKER_SIDE)
+        isr[r] = A1(s.sum()) / yrs(*IS, fb)
+        P(f"  {r}: 연 {isr[r] * 100:+.2f}% (명목 {s.sum() / yrs(*IS, fb) * 100:+.2f}%) · 전환 {sw}회 · 보유 {hf:.0%}")
+    best = max(isr, key=isr.get)
+    P(f"  → 선택: {best}")
+
+    P("\n[2] 확인 구간 2023-01~2026-09 (바이낸스)")
+    oos = {}
+    for r in WIN:
+        s, sw, hf = run(fb, r, *OOS, TAKER_SIDE)
+        sm, _, _ = run(fb, r, *OOS, MAKER_SIDE)
+        y = yrs(*OOS, fb)
+        oos[r] = (A1(s.sum()) / y, s)
+        yr = s.groupby(s.index.year).sum()
+        P(f"  {r}: A1배 연 {A1(s.sum()) / y * 100:+.2f}% · A2배 {s.sum() / 1.5 / y * 100:+.2f}% · A3배 {s.sum() / (4 / 3) / y * 100:+.2f}%"
+          f" · B {s.sum() / y * 100:+.2f}% · 지정가 A1배 {A1(sm.sum()) / y * 100:+.2f}% · 전환 {sw}회 · 보유 {hf:.0%}"
+          f" | 연도별(A1배) " + " ".join(f"{k % 100:02d}:{A1(v) * 100:+.2f}%" for k, v in yr.items()))
+
+    P("\n[3] 판정 (A 경로 · 선물 1배 · 테이커)")
+    j = best if oos[best][0] >= oos["C0"][0] else "C0"
+    c3 = j == best
+    ann, s = oos[j]
+    yr = s.groupby(s.index.year).sum().map(A1)
+    c1, c2 = ann >= 0.04, bool((yr >= 0).all())
+    lo6, hi6 = fo.index[0], fo.index[-1] + pd.Timedelta("1s")
+    ob, bb = fo.mean(), fb[(fb.index >= lo6) & (fb.index < hi6)].mean()
+    c4 = 0.5 <= ob / bb <= 2
+    ok = lambda b: "통과" if b else "불합격"  # noqa: E731
+    P(f"  판정 규칙 {j}{'' if c3 else f' (선택 {best} 가 C0 보다 못해 C0 로 대신)'}")
+    P(f"  ① 자본 대비 연 {ann * 100:+.2f}% ≥ 4% {ok(c1)} · ② 연도별 " + " ".join(f"{k % 100:02d}:{v * 100:+.2f}%" for k, v in yr.items())
+      + f" {ok(c2)} · ③ C0 이상 {ok(c3)}(대체 규칙 적용) · ④ OKX/바이낸스 {ob * 100:.4f}/{bb * 100:.4f}%/8h = {ob / bb:.2f}배 {ok(c4)}")
+    P("  →", "소액 실계좌 후보 (실계좌·금액은 사용자 결정)" if (c1 and c2 and c4) else "기각")
+
+    P("\n[4] 보고 (판정과 무관)")
+    spot = pd.concat([pd.read_pickle(DC / "binance_spot_5m.pkl").loc[:"2019-12-31 23:55"],
+                      pd.read_pickle(DC / "binance_btcusdt_5m_2020.pkl")])
+    R = ((spot.high.rolling(288).max() - spot.low.rolling(288).min()) / spot.low.rolling(288).min()).shift(1)
+    reg = pd.cut(R.reindex(fb.index, method="ffill"), [0, 0.01, 0.03, np.inf], labels=["조용 <1%", "횡보 1~3%", "추세 ≥3%"], right=False)
+    P("  국면별 펀딩(바이낸스, 명목 연율): " + " · ".join(f"{k} {v.mean() * 1095 * 100:+.1f}%(양수 {(v > 0).mean():.0%})" for k, v in fb.groupby(reg, observed=True)))
+    neg = (fb < 0).astype(int); runs = neg.groupby((neg != neg.shift()).cumsum()).sum()
+    P(f"  최장 음수 펀딩 연속 {runs.max()}회({runs.max() / 3:.1f}일) · 최악 30일 합 {fb.rolling(90).sum().min() * 100:+.2f}%(명목)"
+      f" · 최저 한 회 {fb.min() * 100:+.3f}%")
+    P("  연도별 명목 펀딩 합(바이낸스): " + " ".join(f"{k % 100:02d}:{v * 100:+.1f}%" for k, v in fb.groupby(fb.index.year).sum().items()))
+    for r in WIN:
+        s, sw, hf = run(fm, r, fm.index[0], fm.index[-1] + pd.Timedelta("1s"), TAKER_SIDE)
+        P(f"  BitMEX 18-22 {r}: A1배 연 {A1(s.sum()) / yrs(fm.index[0], fm.index[-1], fm) * 100:+.2f}% · 전환 {sw}회 · 보유 {hf:.0%}")
+    day = spot.resample("1D").agg({"high": "max", "close": "last"}).dropna()
+    s0, _, _ = run(fb, "C0", *OOS, TAKER_SIDE)
+    hold_days = set(day.index[(day.index >= OOS[0]) & (day.index < OOS[1])])
+    for L in (2, 3):
+        top, liq = lev_events(day, hold_days, L)
+        P(f"  A {L}배 (C0, 23-26): 증거금 보충 {top}회 · 보충 안 했으면 청산 {liq}회")
+    okx = okx_5m().close
+    sp = spot.close.reindex(okx.index)
+    b = (okx / sp - 1).dropna()
+    b = b[b.index >= T("2021-05-01")]
+    P(f"  괴리(OKX 무기한 / 바이낸스 현물 − 1, 21-26, 거래소 달라 근사): 중앙 {b.median() * 100:+.3f}% · 1% {b.quantile(0.01) * 100:+.3f}%"
+      f" · 99% {b.quantile(0.99) * 100:+.3f}% · 최저 {b.min() * 100:+.2f}% · 최고 {b.max() * 100:+.2f}%")
+    (ROOT / "research" / "carry_result.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
