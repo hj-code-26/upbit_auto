@@ -38,6 +38,6 @@ make reset      모의 장부 초기화
 타임아웃은 '불명' 으로 남기고 다음 사이클에 거래소 상태로 대사, 주문 가능한 프로세스는 하나(포트 락),
 24시간 고점 대비 −15%(MAX_DAY_LOSS_PCT)면 청산 후 신규 진입 정지 (재개 `make on`).
 Claude 검토: 주문 직전에만 OmniRoute(http://localhost:20128) 경유로 호출해 알고리즘 값을 대조·거부한다 (instructions.md).
-모의 3단계: 모의 장부(MODE=paper, 지금) → OKX 데모(MODE=live, OKX_DEMO=1) → 실계좌(OKX_DEMO=0). 설정은 .env.example.
+2단계: 모의 장부(MODE=paper) → 실계좌(MODE=live, 시작 시 '실주문' 입력). OKX 데모는 2026-09-28 제외. 설정은 .env.example.
 실계좌 전 할 일: 실주문 청산은 5분봉 마감 뒤 시장가라 최대 5분 늦다 — 거래소 TP/SL 주문 부착을 검토할 것.
 최소 주문 10 USDT — 1배면 잔고가 10 USDT 이상이어야 주문이 나간다.

@@ -281,3 +281,7 @@ aoa(워뇨띠) BitMEX 거래내역 패턴 분석 — 2026-09-26
      · Q4 봇 청산 뒤 자동 취소 · Q5 flat 에서 reduceOnly 반응 · Q6 total(eq) 의 미실현 포함 · Q7 clOrdId 재조회. 데모 헤더 확인 전 호출 0,
      시작 시 기존 포지션·보호주문 있으면 중단, 끝나면 정리·flat 확인. 가짜 거래소로 끝까지 도는 것 확인(test_protect P13·P14, 14/14).
      **아직 데모에서 돌리지 않았다** — .env 에 데모 키 없음. 결과가 나오면 여기에 Q1~Q7 을 적고 protect.py 연결 여부를 정한다.
+   후속 (같은 날, 사용자 결정): OKX 데모 완전 제외 — okx.py 데모 설정·데모 키·sandbox 제거(항상 실계좌), autotrade·dashboard 데모 주문 경로·버튼 제거,
+     demo_protect.py·make demoprot 삭제. MODE=live 는 곧 실계좌이고 남은 관문은 MODE 와 시작 시 '실주문' 입력뿐이다.
+     보호주문(protect.py) 의 OKX 수락 여부(Q1~Q7)를 확인할 도구가 없어졌다 — 연결 전 실계좌 확인 방법을 따로 정해야 한다.
+     테스트: test_bot · test_leverage · test_audit 19/19 · test_protect 12/12 통과, 대시보드 페이지 JS 문법 검사 통과.

@@ -1,6 +1,6 @@
 """대시보드 (토스증권풍) + 자동매매 스케줄러. 이것만 띄우면 봇도 같이 돈다.
 
-  · 거래소 계좌: OKX(데모 또는 실계좌) 잔고·포지션·평단·평가손익을 폴링해서 그대로 보여준다 (키가 있을 때)
+  · 거래소 계좌: OKX 실계좌 잔고·포지션·평단·평가손익을 폴링해서 그대로 보여준다 (키가 있을 때)
   · 스케줄러: INTERVAL_MIN 분마다 run_cycle() — autotrade.py 를 따로 띄울 필요가 없다
   · 수동 주문: 매수/매도 버튼. auto 모드의 '모의 N회' 게이트를 건너뛰고 바로 거래소 주문이 나가므로
               '실주문' 을 타이핑해야만 전송된다 (실수 클릭·외부 요청 차단)
@@ -45,12 +45,12 @@ def rows(sql):
     return out
 
 
-def live_account(demo=None):
-    """OKX 계좌 현황(데모/실계좌). 키가 없거나 조회가 실패해도 화면은 떠야 하므로 예외를 값으로 돌려준다."""
-    if not A.X.have_keys(A.X.DEMO if demo is None else demo):
+def live_account():
+    """OKX 실계좌 현황. 키가 없거나 조회가 실패해도 화면은 떠야 하므로 예외를 값으로 돌려준다."""
+    if not A.X.have_keys():
         return None
     try:
-        return A.X.snapshot(A.X.client(demo))
+        return A.X.snapshot(A.X.client())
     except Exception as e:                                             # noqa: BLE001
         return {"error": A.X.explain(e)}
 
@@ -58,7 +58,7 @@ def live_account(demo=None):
 @app.get("/api/state")
 def api_state():
     runs = rows("SELECT * FROM runs ORDER BY id DESC LIMIT 200")
-    return {"mode": A.MODE, "live_now": A.live_now(), "have_keys": A.HAVE_KEYS, "coin": A.X.COIN, "demo": A.X.DEMO,
+    return {"mode": A.MODE, "live_now": A.live_now(), "have_keys": A.HAVE_KEYS, "coin": A.X.COIN,
             "leverage": A.LEVERAGE, "position_pct": A.POSITION_PCT, "rule": {"D": S.D, "TP": S.TP, "SL": S.SL, "hours": S.MAXB * 5 / 60},
             "paper_done": A.paper_trades_done(), "live_after": A.LIVE_AFTER, "autorun": A.autorun(),
             "use_claude": A.USE_CLAUDE, "claude_model": A.CLAUDE_MODEL, "backtest": BACKTEST,
@@ -66,7 +66,6 @@ def api_state():
             "interval_min": A.INTERVAL_MIN, "next_run": next_run(runs[0]["timestamp"] if runs else None), "bot_here": BOT_HERE, "min_order": A.X.MIN_ORDER,
             "state": A.state(), "last": runs[0] if runs else None,
             "account": live_account(),
-            "demo_keys": A.X.have_keys(True), "demo_account": live_account(True) if A.X.have_keys(True) and not A.X.DEMO else None,
             "runs": runs[::-1], "orders": rows("SELECT * FROM orders ORDER BY id DESC LIMIT 100")}
 
 
@@ -119,7 +118,7 @@ def api_autorun(body: dict):
 
 @app.post("/api/order")
 def api_order(body: dict):
-    """수동 주문. body = {"action": "buy"|"sell", "confirm": "실주문", "demo": true|false}"""
+    """수동 주문. body = {"action": "buy"|"sell", "confirm": "실주문"}"""
     if not BOT_HERE:
         return JSONResponse({"ok": False, "error": "봇이 다른 프로세스(터미널 make bot 등)에서 돌고 있습니다 — 수동 주문은 봇을 멈춘 뒤 대시보드 단독으로"}, status_code=409)
     if body.get("confirm") != "실주문":
@@ -127,7 +126,7 @@ def api_order(body: dict):
     if body.get("action") not in ("buy", "sell"):
         return JSONResponse({"ok": False, "error": "action 은 buy 또는 sell"}, status_code=400)
     try:
-        return {"ok": True, **A.manual_order(body["action"], bool(body.get("demo")))}
+        return {"ok": True, **A.manual_order(body["action"])}
     except Exception as e:                                             # noqa: BLE001
         A.log.error("수동 주문 실패: %s", e)
         return JSONResponse({"ok": False, "error": str(e)[:200]}, status_code=400)
@@ -196,8 +195,6 @@ h2{font-size:17px;font-weight:700;margin:0 0 14px;letter-spacing:-.3px}
     <div style="display:flex;gap:8px">
       <button class="btn buy" id=buybtn onclick="order('buy')">매수</button>
       <button class="btn sell" id=sellbtn onclick="order('sell')">매도</button>
-      <button class=btn id=dbuybtn onclick="order('buy',true)">데모 매수</button>
-      <button class=btn id=dsellbtn onclick="order('sell',true)">데모 매도</button>
     </div>
   </div>
   <div class=grid id=acctgrid></div>
@@ -219,9 +216,9 @@ const when=t=>t?t.slice(5,16).replace('T',' '):'-';
 async function load(){
   const s=await (await fetch('/api/state')).json(), l=s.last||{}, st=s.state, done=s.runs.filter(r=>r.status==='done');
   window._state=s;
-  const md=document.getElementById('mode'), tag=s.demo?'OKX 데모':'실주문';
-  if(s.live_now){md.className=s.demo?'pill test':'pill live';md.innerHTML='<i></i>'+tag+' 중'}
-  else{md.className='pill';md.innerHTML='<i></i>'+(s.mode==='auto'&&s.have_keys?`모의 장부 ${s.paper_done}/${s.live_after} · 완료 후 ${tag}`:'모의 장부'+(s.have_keys&&!s.demo?' · 실계좌는 잔고만 읽음':''))}
+  const md=document.getElementById('mode'), tag='실주문';
+  if(s.live_now){md.className='pill live';md.innerHTML='<i></i>'+tag+' 중'}
+  else{md.className='pill';md.innerHTML='<i></i>'+(s.mode==='auto'&&s.have_keys?`모의 장부 ${s.paper_done}/${s.live_after} · 완료 후 ${tag}`:'모의 장부'+(s.have_keys?' · 실계좌는 잔고만 읽음':''))}
   document.getElementById('lev').textContent=`${s.leverage}배 · ${Math.round(s.position_pct*100)}%`;
   const rb=document.getElementById('runbtn');if(!s.bot_here){rb.disabled=true;rb.textContent='다른 곳에서 봇 실행 중';rb.title='판단·주문은 터미널(make bot)이 한다 · 이 화면은 보기 전용'}
   const ab=document.getElementById('autobtn');ab.className=s.autorun?'btn':'btn off';ab.textContent=s.autorun?'자동실행 ON':'자동실행 OFF';
@@ -230,7 +227,7 @@ async function load(){
   const a=s.account, live=a&&!a.error;
   const eq=live?a.equity:l.paper_equity;
   const first=done.length?done[0].paper_equity:null;
-  document.getElementById('eqlabel').textContent=live?(s.demo?'내 자산 (OKX 데모)':'내 자산 (OKX 실계좌)'):'내 자산 (모의 장부)';
+  document.getElementById('eqlabel').textContent=live?'내 자산 (OKX 실계좌)':'내 자산 (모의 장부)';
   document.getElementById('equity').textContent=eq!=null?f(eq,2)+' USDT':'-';
   if(live){
     const p=a.position, pnl=p?a.coin_value-p.entry*p.qty:0, pct=p&&p.entry?pnl/(p.entry*p.qty)*100:null;
@@ -243,7 +240,7 @@ async function load(){
   }
   // 현재 수익률: 실계좌면 첫 기록된 실계좌 자산 대비, 없으면 모의 장부 시작 대비
   const base=live?s.real_first:first, cur=eq, rt=document.getElementById('ret');
-  document.getElementById('retlabel').textContent=live?(s.demo?'현재 수익률 (OKX 데모)':'현재 수익률 (OKX 실계좌)'):'현재 수익률 (모의 장부)';
+  document.getElementById('retlabel').textContent=live?'현재 수익률 (OKX 실계좌)':'현재 수익률 (모의 장부)';
   if(base&&cur!=null){const d=cur-base,pc=d/base*100;rt.innerHTML=`<span class="${pc>0?'up':pc<0?'down':'flat'}">${pc>0?'+':''}${f(pc,2)}%</span>`;
     document.getElementById('retsub').textContent=`${d>0?'+':''}${f(d,2)} USDT · 시작 ${f(base,2)} → 현재 ${f(cur,2)}`+(live&&a.position?' · 미실현 포함':'')}
   else{rt.textContent='-';document.getElementById('retsub').textContent='첫 판단 기록 뒤 표시됩니다'}
@@ -258,7 +255,6 @@ async function load(){
     if(a.error){
       document.getElementById('acctgrid').innerHTML=`<div class=stat><div class=label>조회 실패</div><div class=v style="font-size:14px">${a.error}</div></div>`;
       document.getElementById('buybtn').disabled=document.getElementById('sellbtn').disabled=true;
-      demoBtns(s);
     }else{
       const p=a.position;
       const g=[['가용 USDT',f(a.cash,2),a.cash*s.leverage<s.min_order?'최소 주문 미만':`${s.leverage}배 진입 가능`],
@@ -269,9 +265,8 @@ async function load(){
       const paper=s.mode==='paper';
       document.getElementById('buybtn').disabled=!s.bot_here||paper||!!p||a.cash*s.leverage<s.min_order;
       document.getElementById('sellbtn').disabled=!s.bot_here||paper||!p;
-      document.getElementById('accttitle').textContent=s.demo?'OKX 데모 계좌':'OKX 실계좌';
-      document.getElementById('acctnote').textContent=(paper?'MODE=paper 라 실주문이 잠겨 있습니다':(s.demo?'모의투자 서버 · 가짜 돈':'진짜 돈'))+demoNote(s);
-      demoBtns(s);
+      document.getElementById('accttitle').textContent='OKX 실계좌';
+      document.getElementById('acctnote').textContent=paper?'MODE=paper 라 실주문이 잠겨 있습니다':'진짜 돈';
     }
   }else ac.style.display='none';
   const pos=st.side?`<span class="${st.side==='long'?'up':'down'}">${Z[st.side]}</span> ${f(st.qty,6)} ${s.coin}`:'없음';
@@ -286,7 +281,7 @@ async function load(){
     return `<div class=row><div class="ic ${cls}">${err?'!':Z[r.zone]||'-'}</div><div class=m><b>${err?'실패':ACT[r.action]||r.action||'-'}${r.position?' · '+Z[r.position]+' 보유 중':''}</b><span>${err?r.status:r.reason||''}</span></div><div class=r><b>${r.p!=null?(r.p>0?'+':'')+f(r.p,2)+'%':'-'}</b><span>${when(r.timestamp)} · ${r.mode}</span></div></div>`}).join(''):'<div class=empty>아직 판단 기록이 없습니다</div>';
   document.getElementById('orders').innerHTML=s.orders.length?s.orders.map(o=>{
     const ok=o.status==='paper'||o.status==='submitted';
-    return `<div class=row><div class="ic ${ok?o.side:'err'}">${Z[o.side]}</div><div class=m><b>${ACT[o.action]} · ${o.mode==='live'?tag:o.mode==='demo'?'OKX 데모':'모의 장부'}</b><span>${o.reason||''}</span></div><div class=r><b>${f(o.notional,2)} USDT</b><span>${f(o.qty,6)} ${s.coin} @ ${f(o.price,1)} · ${ok?'체결':o.status}</span></div></div>`}).join(''):'<div class=empty>아직 주문이 없습니다</div>';
+    return `<div class=row><div class="ic ${ok?o.side:'err'}">${Z[o.side]}</div><div class=m><b>${ACT[o.action]} · ${o.mode==='live'?tag:o.mode==='paper'?'모의 장부':o.mode}</b><span>${o.reason||''}</span></div><div class=r><b>${f(o.notional,2)} USDT</b><span>${f(o.qty,6)} ${s.coin} @ ${f(o.price,1)} · ${ok?'체결':o.status}</span></div></div>`}).join(''):'<div class=empty>아직 주문이 없습니다</div>';
   const data={labels:done.map(r=>r.timestamp.slice(5,10)),datasets:[
     {label:'거래소',data:done.map(r=>r.real_equity),borderColor:'#3182f6',borderWidth:2.5,pointRadius:0,tension:.3},
     {label:'모의',data:done.map(r=>r.paper_equity),borderColor:'#b0b8c1',borderWidth:2,pointRadius:0,tension:.3}]};
@@ -298,23 +293,14 @@ async function autorun(){
   const r=await (await fetch('/api/autorun',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({on})})).json();
   toast(r.autorun?'자동실행을 켰어요':'자동실행을 껐어요 (판단 건너뜀)');load();
 }
-function demoNote(s){
-  const d=s.demo_account;
-  return !s.demo_keys?' · 데모 키 없음 (.env 의 OKX_DEMO_API_KEY)':d?(d.error?' · 데모 조회 실패':` · 데모 계좌 ${f(d.equity,2)} USDT · 포지션 ${d.position?Z[d.position.side]+' '+f(d.position.qty,6):'없음'}`):'';
-}
-function demoBtns(s){
-  const d=s.demo_account, on=s.bot_here&&s.demo_keys&&!s.demo&&d&&!d.error;
-  document.getElementById('dbuybtn').disabled=!on||!!(d&&d.position);
-  document.getElementById('dsellbtn').disabled=!on||!(d&&d.position);
-}
-async function order(action,demo){
-  const name=(demo?'데모 ':'')+(action==='buy'?'매수':'매도'), s=window._state;
-  const t=prompt(`${name} 주문을 OKX ${demo||s.demo?'데모(모의투자 서버)':'실계좌'}로 보냅니다 (${s.leverage}배). 되돌릴 수 없습니다.\n계속하려면 '실주문' 을 입력하세요.`);
+async function order(action){
+  const name=action==='buy'?'매수':'매도', s=window._state;
+  const t=prompt(`${name} 주문을 OKX 실계좌로 보냅니다 (${s.leverage}배). 되돌릴 수 없습니다.\n계속하려면 '실주문' 을 입력하세요.`);
   if(t===null)return;
-  const b=document.getElementById((demo?'d':'')+(action==='buy'?'buybtn':'sellbtn'));
+  const b=document.getElementById(action==='buy'?'buybtn':'sellbtn');
   b.disabled=true;
   const r=await (await fetch('/api/order',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({action,confirm:t.trim(),demo:!!demo})})).json();
+    body:JSON.stringify({action,confirm:t.trim()})})).json();
   toast(r.ok?`${name} 주문을 보냈습니다 (${f(r.price,1)} USDT)`:`주문 실패: ${r.error}`);
   setTimeout(load,2000);
 }
@@ -378,7 +364,7 @@ if __name__ == "__main__":
         A.confirm_live()                               # autotrade.py 와 같은 '실주문' 확인
         threading.Thread(target=A.schedule_forever, daemon=True).start()
         A.log.info("스케줄러 시작 — %d분마다 · 자동실행 %s · %s · %g배", A.INTERVAL_MIN, "ON" if A.autorun() else "OFF",
-                   "OKX 데모" if A.X.DEMO else "OKX 실계좌", A.LEVERAGE)
+                   "OKX 실계좌", A.LEVERAGE)
     else:
         A.log.info("봇이 다른 프로세스(터미널 make bot)에서 돌고 있습니다 — 대시보드는 보기 전용 (판단·주문 버튼 잠김)")
     # 인증이 없고 /api/order 가 실주문을 보내므로 이 PC 에서만 접속되게 묶는다.

@@ -28,7 +28,7 @@
   5. 봇의 봉 마감 청산 판정(exit_check)은 **그대로 둔다** — 보호주문이 안 걸렸거나 거래소가 발동을 놓친 경우의 예비선.
   모의(paper) 모드는 ex=None 이라 이 모듈을 전혀 부르지 않는다.
 
-데모(OKX_DEMO=1)에서 확인해야 하는 것 (mock 으로는 알 수 없다):
+실계좌에서 확인해야 하는 것 (mock 으로는 알 수 없다 · OKX 데모는 2026-09-28 제외, 확인 도구 없음):
   · closeFraction=1 + oco + 시장가(−1) 조합이 net·격리에서 받아지는지 (51327~51330 오류 계열)
   · 포지션이 봇 시장가로 닫힌 뒤 남은 closeFraction 주문을 OKX 가 자동 취소하는지 (자동이어도 ensure 는 그대로 둔다)
   · 발동된 알고의 자식 주문(ordIdList)을 fetch_order 로 읽을 수 있는지, actualSide 값('tp'/'sl')
@@ -57,10 +57,9 @@ def _near(a, b):
     return abs(float(a) / b - 1) < 1e-5                    # 가격 정밀도(0.1) 반올림 오차만 허용
 
 
-def place(ex, entry, levels=None):
-    """진입가(실제 평단) 기준 익절·손절 OCO 를 건다 → algoClOrdId. 거래소가 거부하면 예외.
-    levels=(익절, 손절) 은 데모 확인(demo_protect.py)에서 발동을 빨리 보려고 좁힐 때만 쓴다."""
-    up, dn = levels or S.levels(entry)
+def place(ex, entry):
+    """진입가(실제 평단) 기준 익절·손절 OCO 를 건다 → algoClOrdId. 거래소가 거부하면 예외."""
+    up, dn = S.levels(entry)
     cid = TAG + uuid.uuid4().hex[:20]
     _ok(ex.private_post_trade_order_algo({
         "instId": _inst(ex), "tdMode": "isolated", "side": "sell", "ordType": "oco",

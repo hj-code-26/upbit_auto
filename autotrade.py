@@ -13,7 +13,7 @@
 
 모의 3단계 (MODE):
   paper : 모의 장부만. 키가 있으면 실계좌 잔고는 읽어서 기록·표시만 한다 (주문 없음)   ← 교체 직후 기본
-  live  : 매 주문을 거래소(OKX_DEMO=1 이면 데모, 0 이면 실계좌)에 보냄
+  live  : 매 주문을 OKX 실계좌에 보냄 (OKX 데모는 2026-09-28 제외)
   auto  : 모의 장부로 시작 → 모의 거래 LIVE_AFTER_PAPER_TRADES 회 완료 뒤 거래소 주문
 사고 차단기 (MAX_DAY_LOSS_PCT, 기본 15%): 24시간 고점 대비 그만큼 빠지면 청산하고 자동실행을 끈다.
   1배 롱이 손절 −6% 를 두고 하루에 −15% 를 잃는다면 손절이 작동하지 않은 것 — 버그·급변을 잡는 값이다. 재개는 make on.
@@ -314,7 +314,7 @@ def unresolved_orders(ex):
     return left
 
 
-def execute(ex, run_id, action, side, qty, notional, px, reason, demo=False, lev=None):
+def execute(ex, run_id, action, side, qty, notional, px, reason, lev=None):
     """action: open|close. → 성공 여부 (True 면 장부·거래소가 같은 상태라고 확인된 것).
 
     실행 순서 (2026-09-10 감사로 뒤집었다). **주문이 먼저, 장부는 나중이다**:
@@ -324,9 +324,8 @@ def execute(ex, run_id, action, side, qty, notional, px, reason, demo=False, lev
       4) 그 값으로 모의 장부를 확정한다
     예전에는 4)→2) 순서였다. 주문이 실패하면 장부에는 포지션이 있고 거래소에는 없었다(또는 반대).
     **타임아웃은 주문 실패가 아니다** — 예외가 나면 다시 조회하고, 그래도 모르면 status='unknown' 으로
-    남긴 채 장부를 건드리지 않는다. 다음 사이클의 account() 대사가 거래소 쪽 진실로 맞춘다.
-    demo=True (대시보드 데모 주문) 는 별도 계좌라 모의 장부를 건드리지 않는다."""
-    mode = "demo" if demo else "live" if ex else "paper"
+    남긴 채 장부를 건드리지 않는다. 다음 사이클의 account() 대사가 거래소 쪽 진실로 맞춘다."""
+    mode = "live" if ex else "paper"
     lev = LEVERAGE if lev is None else lev
     cid = "a" + uuid.uuid4().hex[:20]                      # OKX clOrdId: 영숫자 1~32자
     oid = _order_row(run_id=run_id, timestamp=now(), mode=mode, action=action, side=side, qty=qty or 0,
@@ -366,15 +365,15 @@ def execute(ex, run_id, action, side, qty, notional, px, reason, demo=False, lev
         _order_done(oid, status=status, order_id=ex_id, filled_qty=fill_qty if status == "partial" else 0, fill_price=fill_px)
         log.critical("주문 미완료 (%s %s · %s) — 장부를 바꾸지 않고 다음 사이클에 거래소 상태로 대사합니다", action, side, status)
         return False
-    if not demo:                                           # 체결을 확인한 **뒤에** 장부를 확정한다
-        st, fee = state(), (fill_qty or 0) * fill_px * X.TAKER_FEE
-        if action == "open":
-            fill_qty = fill_qty or notional / fill_px
-            set_state(side=side, qty=fill_qty, entry=fill_px, cash=st["cash"] - fee, entered_at=now(), lev=lev)
-        elif st["side"]:
-            sgn = 1 if st["side"] == "long" else -1
-            set_state(side=None, qty=0, entry=0, entered_at=None,
-                      cash=st["cash"] + sgn * (fill_px - st["entry"]) * st["qty"] - fee)
+    # 체결을 확인한 **뒤에** 장부를 확정한다
+    st, fee = state(), (fill_qty or 0) * fill_px * X.TAKER_FEE
+    if action == "open":
+        fill_qty = fill_qty or notional / fill_px
+        set_state(side=side, qty=fill_qty, entry=fill_px, cash=st["cash"] - fee, entered_at=now(), lev=lev)
+    elif st["side"]:
+        sgn = 1 if st["side"] == "long" else -1
+        set_state(side=None, qty=0, entry=0, entered_at=None,
+                  cash=st["cash"] + sgn * (fill_px - st["entry"]) * st["qty"] - fee)
     _order_done(oid, status=status, order_id=ex_id, filled_qty=fill_qty, fill_price=fill_px, qty=fill_qty or 0)
     log.info("[%s] %s %s %.6f %s (%s USDT, %.2f배) @%s — %s", status, action, side, fill_qty or 0, X.COIN,
              f"{notional:,.2f}", lev, f"{fill_px:,.1f}", reason)
@@ -470,7 +469,7 @@ def run_cycle(source="자동"):
 
 def _run_cycle(source="자동"):
     live = live_now()
-    tag = "데모" if X.DEMO else "실주문"
+    tag = "실주문"
     mode = tag if live else f"모의 ({paper_trades_done()}/{LIVE_AFTER} 완료 후 {tag})" if MODE == "auto" and HAVE_KEYS else "모의"
     mode += f" · {source}"
     with db() as c:
@@ -528,10 +527,10 @@ def _run_cycle(source="자동"):
 
 
 def confirm_live():
-    """진짜 돈이 나갈 수 있는 설정이면 사람이 직접 '실주문' 을 치게 한다. 데모(OKX_DEMO=1)는 묻지 않는다. autotrade·dashboard 공용."""
-    if not (HAVE_KEYS and MODE != "paper" and not X.DEMO):
+    """진짜 돈이 나갈 수 있는 설정이면 사람이 직접 '실주문' 을 치게 한다. autotrade·dashboard 공용."""
+    if not (HAVE_KEYS and MODE != "paper"):
         return
-    msg = f"OKX 실계좌 주문 모드입니다 (OKX_DEMO=0, MODE={MODE}{', 모의 %d회 완료 후 자동 전환' % LIVE_AFTER if MODE == 'auto' else ''}, {LEVERAGE:g}배). '실주문' 을 입력하면 계속합니다: "
+    msg = f"OKX 실계좌 주문 모드입니다 (MODE={MODE}{', 모의 %d회 완료 후 자동 전환' % LIVE_AFTER if MODE == 'auto' else ''}, {LEVERAGE:g}배). '실주문' 을 입력하면 계속합니다: "
     if input(msg).strip() != "실주문":
         sys.exit("취소")
 
@@ -594,25 +593,25 @@ def schedule_forever():
             time.sleep(5)
 
 
-def manual_order(action, demo=False):
+def manual_order(action):
     """대시보드에서 사람이 직접 누른 실주문. auto 모드의 '모의 N회' 게이트와 무관하게 바로 나간다.
     자동 매매와 같은 execute() 를 타므로 주문 기록·장부가 그대로 이어진다."""
-    if not X.have_keys(demo):
-        raise ValueError(f"OKX {'데모' if demo else '실계좌'} API 키가 없습니다")
+    if not X.have_keys():
+        raise ValueError("OKX 실계좌 API 키가 없습니다")
     if not single_instance():
         raise RuntimeError("주문을 낼 수 있는 다른 프로세스가 이미 돌고 있습니다 (make stop 후 하나만 띄우세요)")
     if not _CYCLE.acquire(timeout=30):        # 자동 사이클과 겹치면 같은 포지션에 주문이 두 번 나간다
         raise RuntimeError("자동 사이클이 돌고 있습니다 — 잠시 뒤 다시 누르세요")
     try:
-        return _manual_order(action, demo)
+        return _manual_order(action)
     finally:
         _CYCLE.release()
 
 
-def _manual_order(action, demo=False):
-    if MODE == "paper" and not demo:
-        raise ValueError("MODE=paper 에서는 실주문을 보내지 않습니다 (.env 의 MODE 를 auto 나 live 로). 데모 주문은 그대로 됩니다")
-    ex = X.client(demo)
+def _manual_order(action):
+    if MODE == "paper":
+        raise ValueError("MODE=paper 에서는 실주문을 보내지 않습니다 (.env 의 MODE 를 auto 나 live 로)")
+    ex = X.client()
     snap = X.snapshot(ex)
     px, pos = snap["price"], snap["position"]
     if action == "buy" and pos:
@@ -625,13 +624,13 @@ def _manual_order(action, demo=False):
         run_id = c.execute("INSERT INTO runs (timestamp, mode, status, price, position, action, reason) "
                            "VALUES (?, '수동', 'done', ?, ?, ?, ?)",
                            (now(), px, pos["side"] if pos else None, "open" if action == "buy" else "close",
-                            f"대시보드 수동 {'데모' if demo else '실'}주문")).lastrowid
+                            "대시보드 수동 실주문")).lastrowid
     if action == "buy":
         ok = execute(ex, run_id, "open", "long", None, snap["cash"] * POSITION_PCT * LEVERAGE, px,
-                     f"대시보드 수동 매수{' (데모)' if demo else ''}", demo)
+                     "대시보드 수동 매수")
     else:
         ok = execute(ex, run_id, "close", pos["side"], pos["qty"], pos["qty"] * px, px,
-                     f"대시보드 수동 매도{' (데모)' if demo else ''}", demo)
+                     "대시보드 수동 매도")
     if not ok:
         with db() as c:
             raise RuntimeError(c.execute("SELECT status FROM orders WHERE run_id=? ORDER BY id DESC LIMIT 1",

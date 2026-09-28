@@ -1,7 +1,6 @@
 """OKX USDT 무기한 선물 클라이언트 (ccxt). 격리 마진 · 단방향(net) 포지션. upbit.py 를 대체한다.
 
-  · OKX_DEMO=1 이면 모의투자(Demo Trading) 서버로 주문이 나간다. 키도 데모 전용 키여야 한다
-    (okx.com > 모의투자 > API 에서 발급. 실계좌 키와 다르다).
+  · 실계좌 전용 (2026-09-28 OKX 데모 제외). 주문이 나가는지는 autotrade 의 MODE 와 시작 시 '실주문' 입력이 정한다.
   · 레버리지: setup(ex, LEVERAGE) 가 격리 마진 + 레버리지를 심볼에 설정한다. 명목 = 자산 × POSITION_PCT × LEVERAGE.
   · OKX 주문 단위는 '계약' (BTC-USDT-SWAP 은 1계약 = 0.01 BTC, 최소 0.01 계약) 이지만 봇 안의 qty 는 항상 BTC 수량이다.
     변환은 이 파일의 contracts() 한 곳에서만 한다.
@@ -15,12 +14,11 @@ import ccxt
 import pandas as pd
 from dotenv import load_dotenv
 
-load_dotenv()                # autotrade 보다 먼저 import 되므로 여기서 .env 를 읽어야 SYMBOL·DEMO 가 맞는다
+load_dotenv()                # autotrade 보다 먼저 import 되므로 여기서 .env 를 읽어야 SYMBOL 이 맞는다
 SYMBOL = os.environ.get("SYMBOL", "BTC/USDT:USDT")
 COIN = SYMBOL.split("/")[0]
 CCY = "USDT"
-DEMO = os.environ.get("OKX_DEMO", "1") != "0"          # 기본 대상(자동 매매). 대시보드는 주문마다 demo 를 골라 보낸다
-DEMO_KEYS = ("OKX_DEMO_API_KEY", "OKX_DEMO_SECRET", "OKX_DEMO_PASSPHRASE")   # 데모 서버는 모의투자 전용 키를 쓴다
+KEYS = ("OKX_API_KEY", "OKX_SECRET", "OKX_PASSPHRASE")
 TAKER_FEE = 0.0005          # 0.05% (일반 등급)
 MIN_ORDER = 10              # 최소 명목 (USDT). 0.01계약 × BTC 가격보다 조금 넉넉히
 _MARKET = None
@@ -35,39 +33,33 @@ def explain(e):
                 "okx.com > 우측 상단 프로필 > API > 해당 키 편집 > IP 주소에 추가하세요. "
                 "공유기 재부팅·ISP 재할당으로 IP 가 바뀌면 다시 등록해야 합니다.")
     if "50101" in s:
-        return ("키가 환경과 맞지 않습니다 (50101) — 실계좌 키를 데모 서버에 쓰거나 그 반대입니다. "
-                ".env 의 OKX_DEMO 와 어떤 키를 넣었는지 확인하세요.")
+        return ("키가 환경과 맞지 않습니다 (50101) — 모의투자(데모) 키를 넣은 것 같습니다. "
+                ".env 의 OKX_API_KEY 가 실계좌 키인지 확인하세요.")
     if any(c in s for c in ("50102", "50111", "50113")):
         return ("OKX 인증 실패 — 키·시크릿·패스프레이즈가 틀렸거나 PC 시각이 어긋났습니다 (50102는 타임스탬프). "
                 ".env 값과 윈도우 시계 동기화를 확인하세요.")
     return f"{type(e).__name__}: {s}"[:200]
 
 
-def have_keys(demo=False):
-    return all(os.environ.get(k) for k in (DEMO_KEYS if demo else ("OKX_API_KEY", "OKX_SECRET", "OKX_PASSPHRASE")))
+def have_keys():
+    return all(os.environ.get(k) for k in KEYS)
 
 
-def _ex(keys, demo=None):
-    demo = DEMO if demo is None else demo
+def _ex(keys):
     cfg = {"enableRateLimit": True, "options": {"defaultType": "swap"}}
     if keys:
-        if not have_keys(demo):
-            raise ValueError(f".env 에 {', '.join(DEMO_KEYS)} 가 없습니다" if demo else ".env 에 OKX 키가 없습니다")
-        k = DEMO_KEYS if demo else ("OKX_API_KEY", "OKX_SECRET", "OKX_PASSPHRASE")
-        cfg.update(apiKey=os.environ[k[0]], secret=os.environ[k[1]], password=os.environ[k[2]])
-    ex = ccxt.okx(cfg)
-    if demo:
-        ex.set_sandbox_mode(True)
-    return ex
+        if not have_keys():
+            raise ValueError(".env 에 OKX 키가 없습니다")
+        cfg.update(apiKey=os.environ[KEYS[0]], secret=os.environ[KEYS[1]], password=os.environ[KEYS[2]])
+    return ccxt.okx(cfg)
 
 
 def public():
     return _ex(False)
 
 
-def client(demo=None):
-    """demo=None 이면 .env 의 OKX_DEMO 를 따른다. 대시보드는 True/False 를 직접 준다."""
-    return _ex(True, demo)
+def client():
+    return _ex(True)
 
 
 def market(ex):
@@ -214,18 +206,18 @@ def open_orders(ex):
 
 if __name__ == "__main__":
     if "keys" in sys.argv:                       # python okx.py keys — 키가 맞는지 잔고 조회로 확인 (주문 안 함)
-        missing = [k for k in ("OKX_API_KEY", "OKX_SECRET", "OKX_PASSPHRASE") if not os.environ.get(k)]
+        missing = [k for k in KEYS if not os.environ.get(k)]
         if missing:
             sys.exit(f".env 에 {', '.join(missing)} 가 비어 있습니다")
         try:
             snap = snapshot(client())
         except Exception as e:                   # noqa: BLE001 — 스택 대신 무엇을 고쳐야 하는지 한 줄로
             sys.exit(explain(e))
-        print(f"ok  {'데모' if DEMO else '실계좌'} 잔고 {snap['equity']:,.2f} USDT (가용 {snap['cash']:,.2f}) · "
+        print(f"ok  실계좌 잔고 {snap['equity']:,.2f} USDT (가용 {snap['cash']:,.2f}) · "
               f"{COIN} {snap['price']:,.1f} · 포지션 {snap['position'] or '없음'}")
         sys.exit()
     assert "121.0.0.1" in explain(Exception('{"msg":"Your IP 121.0.0.1 is not in your API key IP whitelist.","code":"50110"}'))
-    assert "OKX_DEMO" in explain(Exception('{"msg":"APIKey does not match current environment.","code":"50101"}'))
+    assert "50101" in explain(Exception('{"msg":"APIKey does not match current environment.","code":"50101"}'))
     assert explain(ValueError("boom")).startswith("ValueError")
     ex = public()
     df = candles(ex, 30)
@@ -234,4 +226,4 @@ if __name__ == "__main__":
     assert abs(px / df.close.iloc[-1] - 1) < 0.5
     n = contracts(ex, 100 / px)
     assert 0 < n * float(market(ex)["contractSize"]) * px <= 100
-    print("ok", SYMBOL, "demo" if DEMO else "LIVE", df.index[-1], f"{px:,.1f}", "100USDT =", n, "계약")
+    print("ok", SYMBOL, df.index[-1], f"{px:,.1f}", "100USDT =", n, "계약")

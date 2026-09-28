@@ -153,10 +153,7 @@ try:
     assert cycle(bars(start=T0 + pd.Timedelta("9D"), dip=3))[0] == "hold" and A.state()["side"] == "short"
     flat()
 
-    # ── 모의 장부 · 데모 · 사고 차단기 ──
-    before = A.state()
-    A.execute(None, 0, "open", "long", 0.01, 0.01 * PX, PX, "demo test", demo=True)
-    assert A.state() == before, "데모 주문이 모의 장부를 바꿨다"
+    # ── 사고 차단기 ──
     with A.db() as db:
         db.execute("INSERT INTO runs (timestamp, equity, paper_equity, real_equity) VALUES (?, 1000, 1000, 7)", (A.now(),))
     assert not A.day_loss_hit(900), "고점 대비 −10% 는 아직 아니다 (15%)"

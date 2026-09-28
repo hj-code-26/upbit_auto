@@ -197,7 +197,7 @@ def patched(mod, **kw):
 
 def cycle_now(pub, client=None):
     """_run_cycle 전체(데이터 수집 → 확정 봉 → 신호 → 주문)를 가짜 거래소로 돌린다."""
-    with patched(X, public=lambda: pub, client=lambda demo=None: client or _no_net()):
+    with patched(X, public=lambda: pub, client=lambda: client or _no_net()):
         A._run_cycle("감사")
     with A.db() as db:
         return db.execute("SELECT action, reason, status FROM runs ORDER BY id DESC LIMIT 1").fetchone()

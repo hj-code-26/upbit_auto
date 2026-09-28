@@ -174,7 +174,7 @@ def t8():
 def t9():
     ex = AlgoEx()
     open_long(ex, PX)
-    ex.place_err = "51330"                                  # 데모 확인 전: closeFraction 조합 거부 가능성
+    ex.place_err = "51330"                                  # 실계좌 확인 전: closeFraction 조합 거부 가능성
     ok, why = P.ensure(ex, pos_of(ex))
     assert not ok and "51330" in why and ex.pos > 0, why    # 포지션은 남고, 봇 봉 마감 판정이 예비선
     ex.place_err = None
@@ -209,38 +209,12 @@ def t12():
     assert not ok, f"걸었다는 응답만 믿고 확인 없이 보호 중이라고 보고했다: {why}"
 
 
-def t13():
-    import demo_protect as D
-    D.OUT, D.LINES[:] = TA.TMP / "demo_protect_result.txt", []
-    ex = AlgoEx()
-    ex.headers, ex.options = {"x-simulated-trading": "1"}, {"sandboxMode": True}
-    D.run(ex, wait=lambda s: ex.move(ex.px * 0.999) if s == 10 else None, fire_minutes=1)
-    txt = "\n".join(D.LINES)
-    for q in ("Q1", "Q2", "Q3", "Q4", "Q5", "Q6", "Q7", "D2", "D3"):
-        assert f"[{q}]" in txt, f"{q} 단계를 건너뛰었다:\n{txt}"
-    assert "actualSide 'sl'" in txt and "flat · 봇 보호주문 0개" in txt and ex.pos == 0 and ex.min_pos >= 0, txt
-    assert D.OUT.exists()
-
-
-def t14():
-    import demo_protect as D
-    ex = AlgoEx()
-    ex.headers, ex.options = {}, {"sandboxMode": False}      # 실계좌 클라이언트
-    try:
-        D.run(ex, wait=lambda s: None)
-        raise AssertionError("데모가 아닌데 실행됐다")
-    except SystemExit:
-        pass
-    assert not ex.calls and not ex.orders, f"데모 확인 전에 호출했다: {ex.calls}"
-
-
 CASES = [("P1", "실제 체결 평단으로 문턱 · closeFraction·reduceOnly·last·시장가", t1), ("P2", "ensure 반복해도 보호주문 1개", t2),
          ("P3", "재시작·흡수 포지션에 보호주문 보충", t3), ("P4", "틀린 문턱 → 취소 후 재설정", t4),
          ("P5", "다운타임 중 갭 손절 → 실제 체결가로 결과 확인", t5), ("P6", "봇 청산 뒤 남은 보호주문 정리 · 새 포지션에 옛 문턱 안 씀", t6),
          ("P7", "거래소 손절과 봇 청산 경합 → 숏 없음", t7), ("P8", "flat 인데 취소 실패 → 신규 진입 금지 신호", t8),
          ("P9", "보호주문 거부 → 실패 보고 · 다음 사이클 재시도", t9), ("P10", "부분 체결 포지션 전량만 닫음", t10),
-         ("P11", "사람이 건 알고 주문은 안 건드림 · 충돌은 실패로 보고", t11), ("P12", "건 뒤 목록에서 확인 안 되면 실패로 보고", t12),
-         ("P13", "데모 확인 절차가 가짜 거래소에서 끝까지 돌고 정리까지 한다", t13), ("P14", "데모가 아니면 아무 호출 없이 중단", t14)]
+         ("P11", "사람이 건 알고 주문은 안 건드림 · 충돌은 실패로 보고", t11), ("P12", "건 뒤 목록에서 확인 안 되면 실패로 보고", t12)]
 
 if __name__ == "__main__":
     bad = []
