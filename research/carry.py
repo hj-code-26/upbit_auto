@@ -107,13 +107,13 @@ def yrs(lo, hi, f):
 def lev_events(px, hold_idx, L):
     """A 경로 선물 L배: 보유 중 일봉 고가가 기준가 대비 (+0.5/L) 에 닿으면 보충 1회(기준가 갱신),
     (+1/L − 0.4%) 에 닿으면 '보충 안 했으면 청산' 1회(기준가 갱신)."""
-    top = liq = 0; ref = None
+    top = liq = 0; ref = raw = None                  # ref: 보충할 때 갱신 · raw: 보충 없이 청산될 때만 갱신
     for d, (h, c) in px.iterrows():
         if d not in hold_idx:
-            ref = None; continue
-        ref = c if ref is None else ref
-        if h >= ref * (1 + 1 / L - 0.004):
-            liq += 1
+            ref = raw = None; continue
+        ref = c if ref is None else ref; raw = c if raw is None else raw
+        if h >= raw * (1 + 1 / L - 0.004):
+            liq += 1; raw = h
         if h >= ref * (1 + 0.5 / L):
             top += 1; ref = h
     return top, liq

@@ -53,4 +53,191 @@
       봉 안 순서(체결 → 손절 → 익절)를 모르는 부분은 전부 불리하게 잡았다. 알트는 현물 데이터라 펀딩은 같은 고정률.
 사용: python research/aoa/range_rev.py   (결과 → research/aoa/range_rev_result.txt)   ※ 구현 전 — 이 설계서를 커밋한 뒤 작성한다.
 """
-raise SystemExit("설계서만 있음 — 구현 전")
+import pathlib
+import sys
+
+import numpy as np
+import pandas as pd
+
+HERE = pathlib.Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE)); sys.path.insert(0, str(HERE.parents[1]))
+import exec_model as M  # noqa: E402
+import features as F  # noqa: E402
+import strategy as S  # noqa: E402
+from clone import okx_5m  # noqa: E402
+
+MAKER, TAKER, FUND = 0.0002, 0.0007, 0.0001
+HOLD, WAIT = 288, 12
+ALTS = ["ETHUSDT", "SOLUSDT", "XRPUSDT", "BNBUSDT", "DOGEUSDT", "ADAUSDT"]
+
+
+def feats(c, d1, box=288, volok=None):
+    H = c.high.rolling(box).max().shift(1); L = c.low.rolling(box).min().shift(1)
+    R = (H - L) / L
+    d = c.close.diff()
+    up = d.clip(lower=0).ewm(alpha=1 / 14, adjust=False).mean()
+    dn = (-d).clip(lower=0).ewm(alpha=1 / 14, adjust=False).mean()
+    if volok is None:
+        volok = (c.volume < 3 * c.volume.rolling(288).median().shift(1)).values
+    return dict(H=H.values, L=L.values, R=R.values, side=((R >= 0.01) & (R < 0.03)).values,
+                bull=S.indicators(c, d1)[1].values, pos=((c.close - L) / (H - L)).values,
+                rsi=(100 - 100 / (1 + up / dn)).values, vol=volok)
+
+
+def sigs(f, bull=True, rsi=True, vol=True, low=True):
+    s = f["side"].copy()
+    if low: s &= (f["pos"] >= 0) & (f["pos"] <= 0.15)
+    if bull: s &= f["bull"]
+    if rsi: s &= (f["rsi"] >= 20) & (f["rsi"] <= 40)
+    if vol: s &= f["vol"]
+    return s
+
+
+def sim(c, f, sig, lo, hi, model="M"):
+    """→ (거래 DataFrame t0·t1·why·r·mae, 미체결 취소 수). 규칙은 머리말 그대로."""
+    o, h, l, cl, idx = c.open.values, c.high.values, c.low.values, c.close.values, c.index
+    H, L = f["H"], f["L"]
+    n, i, i1 = len(o), idx.searchsorted(lo), idx.searchsorted(hi)
+    cand, out, cancel = np.flatnonzero(sig), [], 0
+    while True:
+        p = np.searchsorted(cand, i)
+        if p >= len(cand):
+            break
+        k = cand[p]
+        if k >= i1 or k + WAIT + HOLD + 3 >= n:
+            break
+        tp, sl = L[k] + 0.5 * (H[k] - L[k]), L[k] * 0.99
+        if model == "M":
+            P = cl[k] * 0.999
+            hit = np.flatnonzero(l[k + 1:k + 1 + WAIT] < P)
+            if not len(hit):
+                cancel += 1; i = k + WAIT + 1; continue
+            e = k + 1 + hit[0]; entry, c_in = P, MAKER
+        else:
+            e = k + 1; entry, c_in = o[e], TAKER
+        if l[e] <= sl:                                     # 체결 봉 손절
+            j, why, px, xb = e, "손절", min(sl, o[e]), e
+        else:
+            a = np.flatnonzero(l[e + 1:e + HOLD + 1] <= sl); b = np.flatnonzero(h[e + 1:e + HOLD + 1] > tp)
+            ja, jb = (a[0] if len(a) else HOLD), (b[0] if len(b) else HOLD)
+            if ja == HOLD and jb == HOLD:
+                j = xb = e + HOLD + 1; why, px = "만기", o[j]
+            elif ja <= jb:                                  # 한 봉에 둘 다 → 손절
+                j = xb = e + 1 + ja; why, px = "손절", min(sl, o[j])
+            else:
+                j = e + 1 + jb; why = "익절"
+                px, xb = (tp, j) if model == "M" else (o[j + 1], j + 1)
+        c_out = MAKER if (why == "익절" and model == "M") else TAKER
+        r = px / entry - 1 - c_in - c_out - FUND * (xb - e) / 96
+        seen = l[e:xb] if why == "만기" else l[e:j + 1]
+        out.append(dict(t0=idx[e], t1=idx[xb], why=why, r=r, mae=min(seen.min() / entry - 1, px / entry - 1)))
+        i = xb if why == "만기" else xb + 1
+    return pd.DataFrame(out, columns=["t0", "t1", "why", "r", "mae"]), cancel
+
+
+def stats(tr, days, lev=1):
+    if tr.empty:
+        return dict(n=0, ev=np.nan, win=np.nan, cagr=0.0, mdd=0.0, top=np.nan)
+    r = tr.r * lev
+    p, mdd, _, _ = M.curve(tr.assign(mae=tr.mae * lev), r.reset_index(drop=True))
+    return dict(n=len(tr), ev=r.mean(), win=(r > 0).mean(), cagr=(p[-1] ** (365.25 / days) - 1) * 100, mdd=mdd,
+                top=r.sort_values().iloc[:-3].mean() if len(r) > 3 else np.nan)
+
+
+def line(tag, tr, cancel, days):
+    s1, s2 = stats(tr, days), stats(tr, days, 2)
+    why = tr.why.value_counts() if len(tr) else {}
+    ys = " ".join(f"{y % 100:02d}:{k}" for y, k in tr.t0.dt.year.value_counts().sort_index().items()) if len(tr) else ""
+    return (f"  {tag:10s} {s1['n']:>4}건 ({days / max(s1['n'], 1):4.1f}일에 1번) 승률 {s1['win']:.0%} 거래당 {s1['ev'] * 100:+.3f}% "
+            f"상위3제외 {s1['top'] * 100:+.3f}% 익/손/만/취소 {why.get('익절', 0)}/{why.get('손절', 0)}/{why.get('만기', 0)}/{cancel} | "
+            f"1배 연{s1['cagr']:+.1f}% MDD{s1['mdd'] * 100:.0f}% · 2배 연{s2['cagr']:+.1f}% MDD{s2['mdd'] * 100:.0f}% | {ys}"), s1
+
+
+def mask(idx, tr):
+    m = np.zeros(len(idx), bool)
+    for a, b in zip(idx.searchsorted(tr.t0), idx.searchsorted(tr.t1)):
+        m[a:b] = True
+    return m
+
+
+def combo(c, d1, lo, hi, tr, days):
+    """급락 매수(B2) 와 같이 돌릴 때 — 동시 보유 · 일별 손익 상관 · 자본 절반씩 합산(재조정 없음, 일말 평가)."""
+    dp = M.trades(c, d1, lo, hi, skip=1)
+    rd = pd.Series(np.asarray(M.net(dp, "B", 0.0, "lo", 0.0007, FUND), float))
+    both = (mask(c.index, tr) & mask(c.index, dp)).sum() * 5 / 1440
+    days_ix = pd.date_range(lo.normalize(), hi, freq="1D", tz="UTC")
+    pa = pd.Series(tr.r.values, index=tr.t1.dt.floor("D")).groupby(level=0).sum().reindex(days_ix, fill_value=0)
+    pb = pd.Series(rd.values, index=dp.t1.dt.floor("D")).groupby(level=0).sum().reindex(days_ix, fill_value=0)
+    ea = (1 + pd.Series(tr.r.values, index=tr.t1)).cumprod().resample("1D").last().reindex(days_ix).ffill().fillna(1)
+    eb = (1 + pd.Series(rd.values, index=dp.t1)).cumprod().resample("1D").last().reindex(days_ix).ffill().fillna(1)
+    eq = 0.5 * ea + 0.5 * eb
+    f = lambda e: f"연{(e.iloc[-1] ** (365.25 / days) - 1) * 100:+.1f}% MDD{(e / e.cummax() - 1).min() * 100:.0f}%"  # noqa: E731
+    return f"  급락매수와 같이: 동시 보유 {both:.1f}일 · 일별 손익 상관 {pa.corr(pb):+.2f} · 횡보만 {f(ea)} · 급락만 {f(eb)} · 반반 {f(eq)}"
+
+
+def share(c, f, lo, hi):
+    """횡보 비중 — 5분봉 기준(직전 24h 박스 폭) + 일봉 기준(그날 고저폭)."""
+    sel = (c.index >= lo) & (c.index < hi) & ~np.isnan(f["R"])
+    R = f["R"][sel]
+    dd = c[(c.index >= lo) & (c.index < hi)].resample("1D").agg({"high": "max", "low": "min"})
+    dr = (dd.high - dd.low) / dd.low
+    yr = pd.Series(f["side"][sel], index=c.index[sel]).groupby(c.index[sel].year).mean()
+    return (f"  횡보 비중: 24h 박스 폭 <1% {np.mean(R < 0.01):.1%} · 1~3% {np.mean((R >= 0.01) & (R < 0.03)):.1%} · ≥3% {np.mean(R >= 0.03):.1%}"
+            f" · 1~3% & 50·200일선 위 {np.mean(f['side'][sel] & f['bull'][sel]):.1%} | 하루 고저폭 <2% {np.mean(dr < 0.02):.1%} · <3% {np.mean(dr < 0.03):.1%}"
+            f" | 연도별(1~3%) " + " ".join(f"{y % 100:02d}:{v:.0%}" for y, v in yr.items()))
+
+
+if __name__ == "__main__":
+    T = lambda s: pd.Timestamp(s, tz="UTC")  # noqa: E731
+    lines = []
+    P = lambda *a: (print(*a, flush=True), lines.append(" ".join(map(str, a))))  # noqa: E731
+    P(__doc__.split("\n")[0])
+    bs = pd.read_pickle(F.ROOT / "data_cache" / "bitstamp_1d_2016.pkl").close
+    btc = [("BitMEX 18-21", F.candles().loc["2018-01-01":"2022-01-10"], "2018-03-05", "2022-01-01"),
+           ("바이낸스 20-26", pd.read_pickle(F.ROOT / "data_cache" / "binance_btcusdt_5m_2020.pkl").asfreq("5min").ffill(),
+            "2020-03-01", "2026-10-01"),
+           ("OKX 21-26", okx_5m(), "2021-05-01", "2026-10-01")]
+    sets = [(nm, c, d0, d9, True) for nm, c, d0, d9 in btc]
+    for sym in ALTS:
+        sets.append((sym, pd.read_pickle(F.ROOT / "data_cache" / f"binance_{sym.lower()}_5m_2020.pkl").asfreq("5min").ffill(),
+                     "2020-01-01", "2026-10-01", False))
+    res = {}
+    for name, c, d0, d9, is_btc in sets:
+        own = c.close.resample("1D").last()
+        d1 = pd.concat([bs[bs.index < own.index[0]], own]) if is_btc else own
+        lo, hi = max(T(d0), c.index[0]), T(d9)
+        days = (min(hi, c.index[-1]) - lo).days
+        f = feats(c, d1)
+        P(f"\n[{name}] {days / 365.25:.1f}년")
+        P(share(c, f, lo, hi))
+        runs = [("M 주판정", sigs(f), "M", f), ("T 시장가", sigs(f), "T", f),
+                ("Z 기준선", sigs(f, rsi=False, vol=False, low=False), "M", f)]
+        if is_btc:
+            f4 = feats(c, d1, box=48, volok=f["vol"])
+            runs += [("V1 국면끔", sigs(f, bull=False), "M", f), ("V2 RSI없음", sigs(f, rsi=False), "M", f),
+                     ("V3 거래량없음", sigs(f, vol=False), "M", f), ("V4 박스4h", sigs(f4), "M", f4)]
+        main = None
+        for tag, sg, model, ff in runs:
+            tr, cancel = sim(c, ff, sg, lo, hi, model)
+            txt, s1 = line(tag, tr, cancel, days)
+            P(txt)
+            res[(name, tag)] = s1
+            if tag == "M 주판정":
+                main = tr
+                t26 = tr[tr.t0.dt.year == 2026] if len(tr) else tr
+                P(f"  2026: {len(t26)}건 거래당 {t26.r.mean() * 100 if len(t26) else float('nan'):+.3f}%")
+        if is_btc and main is not None and len(main):
+            P(combo(c, d1, lo, hi, main, days))
+    names = [b[0] for b in btc]
+    g = lambda nm, t, k: res[(nm, t)][k]  # noqa: E731
+    c1 = all(g(n, "M 주판정", "ev") > 0 for n in names)
+    c2 = all(g(n, "M 주판정", "ev") > g(n, "Z 기준선", "ev") for n in names)
+    k3 = sum(g(n, "T 시장가", "ev") > 0 for n in names); c3 = k3 >= 2
+    k4 = sum(g(s, "M 주판정", "ev") > 0 for s in ALTS); c4 = k4 >= 4
+    c5 = all(g(n, "M 주판정", "mdd") >= -0.25 for n in names)
+    c6 = g("OKX 21-26", "M 주판정", "n") >= 30
+    ok = lambda b: "통과" if b else "불합격"  # noqa: E731
+    P(f"\n판정: ① BTC 거래당>0 {ok(c1)} · ② >기준선 Z {ok(c2)} · ③ 시장가 {k3}/3 {ok(c3)} · ④ 알트 {k4}/6 {ok(c4)}"
+      f" · ⑤ MDD≥−25% {ok(c5)} · ⑥ OKX {g('OKX 21-26', 'M 주판정', 'n')}건 {ok(c6)}")
+    P("  →", "모의 운용 후보 (운영 반영은 사용자 결정)" if all([c1, c2, c3, c4, c5, c6]) else "기각")
+    (HERE / "range_rev_result.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
