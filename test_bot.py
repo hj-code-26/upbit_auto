@@ -18,6 +18,10 @@ DB.unlink(missing_ok=True)
 import autotrade as A                                     # noqa: E402
 import strategy as S                                      # noqa: E402
 
+for h in A.logging.getLogger().handlers[:]:               # 운영 로그(autotrade.log)에 테스트 줄을 쓰지 않는다 (2026-09-30: 99줄 섞였다)
+    if isinstance(h, A.logging.FileHandler):
+        A.logging.getLogger().removeHandler(h)
+        h.close()
 A.DB_PATH = DB
 A.USE_CLAUDE = False
 A.AUTORUN_OFF = ROOT / "test_autorun.off"

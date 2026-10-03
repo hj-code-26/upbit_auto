@@ -5,6 +5,7 @@ okx.py 의 실제 함수(open_position · close_position · find_order · bars_s
 OPEN = 재현만 하고 고치지 않은 결함 (주문 생명주기·청산 의미 변경이라 승인 대기). 그 밖의 실패가 있으면 exit 1.
 사용: python test_audit.py
 """
+import builtins
 import contextlib
 import logging
 import os
@@ -13,10 +14,12 @@ import sys
 import tempfile
 import time
 
+import ccxt
 import numpy as np
 import pandas as pd
+from ccxt.base.decimal_to_precision import TICK_SIZE, TRUNCATE, decimal_to_precision
 
-TMP = pathlib.Path(tempfile.mkdtemp(prefix="coin_audit_"))
+TMP =pathlib.Path(tempfile.mkdtemp(prefix="coin_audit_"))
 os.environ.update(MODE="paper", PAPER_CASH="1000", SYMBOL="BTC/USDT:USDT", LEVERAGE="1", MAX_DAY_LOSS_PCT="15")
 
 import autotrade as A                                     # noqa: E402
@@ -47,12 +50,14 @@ UP = pd.Series(np.linspace(50_000, 90_000, 280), index=pd.date_range(T0.normaliz
 class FakeEx:
     """ccxt.okx 흉내 (단방향 · 격리). create_order 반응은 modes 큐로 정한다:
     fill 전량 · partial 절반 체결 후 잔량 취소 · reject 체결 0 취소 · lost 체결됐는데 응답 유실(예외)
-    · limbo 접수됐지만 아직 체결·조회 안 됨(예외) · down 거래소에 닿기 전 끊김(예외)."""
+    · limbo 접수됐지만 아직 체결·조회 안 됨(예외) · down 거래소에 닿기 전 끊김(예외)
+    · refuse 거래소가 응답으로 거절 (ccxt.ExchangeError — 주문이 안 생겼다는 확정 정보)."""
 
     def __init__(self, px=PX, cash=1000.0, pos=0.0, entry=0.0, locked=0.0, m5=None, d1=None):
         self.px, self.cash, self.pos, self.entry, self.locked = px, cash, pos, entry, locked
         self.m5, self.d1, self.modes, self.orders, self.calls = m5, d1, [], {}, []
         self.lag, self.min_pos = False, pos
+        self.cfg = {"acctLv": "2", "posMode": "net_mode", "perm": "read_only,trade"}   # 2026-09-30 실계좌 조회 형식
 
     def load_markets(self):
         return {X.SYMBOL: {"contractSize": CS}}
@@ -68,7 +73,12 @@ class FakeEx:
         return [{"contracts": self.pos, "side": "long", "entryPrice": self.entry, "info": {}}] if self.pos > 1e-12 else []
 
     def amount_to_precision(self, s, n):
-        return str(np.floor(n * 100 + 1e-9) / 100)
+        """실제 ccxt(OKX) 와 같은 의미: 문자열 기준 TRUNCATE(0.01), 결과가 0 이면 InvalidOrder (2026-09-30 실측으로 대조).
+        예전 흉내는 +1e-9 를 더해 float 오차(0.029999…→0.02)를 가렸다 — 그래서 18번 결함이 안 보였다."""
+        out = decimal_to_precision(n, TRUNCATE, 0.01, TICK_SIZE)
+        if float(out) == 0:
+            raise ccxt.InvalidOrder("amount must be greater than minimum amount precision of 0.01")
+        return out
 
     def set_position_mode(self, *a):
         self.calls.append(("set_position_mode",))
@@ -76,8 +86,8 @@ class FakeEx:
     def set_leverage(self, *a, **k):
         self.calls.append(("set_leverage",))
 
-    def private_get_account_config(self):
-        return {"data": [{"posMode": "net_mode"}]}
+    def private_get_account_config(self, params=None):
+        return {"data": [self.cfg]}
 
     def create_order(self, sym, typ, side, n, params=None):
         params = dict(params or {})
@@ -85,6 +95,8 @@ class FakeEx:
         mode = self.modes.pop(0) if self.modes else "fill"
         if mode == "down":
             raise ConnectionError("connection reset")
+        if mode == "refuse":
+            raise ccxt.InsufficientFunds('okx {"code":"1","data":[{"sCode":"51008","sMsg":"Order failed. Insufficient USDT margin"}]}')
         if side == "sell" and params.get("reduceOnly"):
             n = min(n, self.pos)                                  # reduceOnly 는 포지션을 넘지 못한다
         f = {"fill": n, "lost": n, "partial": np.floor(n * 50) / 100, "reject": 0.0, "limbo": 0.0}[mode]
@@ -392,6 +404,12 @@ def s13():
         reset()
         act(ex, bars(dip=3))
         assert not ex.buys(), f"최소 수량 미달인데 제출했다: {ex.buys()}"
+        # 2026-09-30: 제출 전에 알 수 있는 거부는 '제출 전' 에 막아야 한다 — 계좌 설정(레버리지·포지션 모드)을 먼저 바꾸거나
+        # 안 나간 주문을 '상태 불명' 으로 적어 30분 진입 차단·CRITICAL 경보를 내면 안 된다
+        assert not [c for c in ex.calls if c[0] in ("set_leverage", "set_position_mode")], f"제출 불가 주문 앞에서 계좌 설정을 바꿨다: {ex.calls}"
+        with A.db() as db:
+            unk = db.execute("SELECT status FROM orders WHERE status LIKE 'unknown%'").fetchall()
+        assert not unk, f"제출하지 않은 주문을 상태 불명으로 적었다: {unk}"
     reset()
     ex = FakeEx(locked=900.0)                              # 자산 1000 중 가용 100
     act(ex, bars(dip=3))
@@ -442,6 +460,75 @@ def s17():
     assert A.state()["side"] is None, f"거래소가 거부(체결 0)했는데 장부에 롱: {last_order()}"
 
 
+def s18():
+    """거래소가 보고한 포지션 전량을 청산 주문 수량으로 보내는가 (계약 → BTC → 계약 왕복의 float 오차)."""
+    for ct in (0.03, 0.06, 0.41, 1.23):                    # 0.03계약 × 0.01 = 0.00030000000000000003 BTC 등
+        reset()
+        ex = FakeEx(pos=ct, entry=PX, px=PX * 0.93)
+        c = bars()
+        hold_long(qty=ct * CS, bar=c.index[-1] + S.BAR)
+        act(ex, after(c, (PX, PX, PX * 0.93, PX * 0.93)))   # 손절
+        assert ex.pos == 0 and ex.min_pos >= 0, f"{ct}계약 청산 주문이 {ex.sells()[-1][2]}계약만 보냈다 → 잔량 {ex.pos:.2f}계약 방치"
+        assert A.state()["side"] is None
+
+
+def s19():
+    """체결 뒤 DB 기록 전에 죽고 한참 뒤 재시작 — 다운타임 중 손절 통과를 흡수 뒤에도 판정하는가."""
+    reset()
+    ex = FakeEx(pos=1.23, entry=PX, px=PX * 0.95)
+    c = bars()
+    t_fill = c.index[-1] + pd.Timedelta("15s")            # 신호 봉 마감 15초 뒤 체결 (마지막 봉 = 진입 봉)
+    A._order_row(run_id=0, timestamp=t_fill.tz_convert(A.KST).isoformat(), mode="live", action="open", side="long", qty=0,
+                 notional=984, price=PX, client_id="acrash", status="intent", reason="t")
+    ex.orders["acrash"] = {"status": "closed", "filled": 1.23, "average": PX, "id": "o0", "hidden": False, "side": "buy", "n": 1.23}
+    A.set_state(seen_bar=c.index[-2].isoformat())
+    c = after(c, (PX, PX, PX, PX), (PX, PX, PX * 0.93, PX * 0.95), (PX * 0.95, PX * 0.96, PX * 0.95, PX * 0.95))   # 다운타임 중 손절 통과
+    act(ex, c)
+    assert ex.pos == 0, "흡수한 포지션의 진입 시각을 재시작 시각으로 적어 다운타임 중 손절 통과를 못 봤다 (만기도 그만큼 밀린다)"
+    # 반대 경우: 봇의 마지막 진입은 이미 청산 기록까지 끝났고, 지금 포지션은 사람이 연 것 → 옛 주문 시각으로 거슬러 가면 안 된다
+    reset()
+    ex = FakeEx(pos=1.23, entry=PX)
+    old = (T0 - pd.Timedelta("2D")).tz_convert(A.KST).isoformat()
+    for cid, action, st_ in (("aold1", "open", "filled"), ("aold2", "close", "filled")):
+        A._order_row(run_id=0, timestamp=old, mode="live", action=action, side="long", qty=1.23, notional=984,
+                     price=PX, client_id=cid, status=st_, reason="t")
+        ex.orders[cid] = {"status": "closed", "filled": 1.23, "average": PX, "id": cid, "hidden": False, "side": "buy", "n": 1.23}
+    A.account(ex, PX)
+    got = pd.Timestamp(A.state()["entered_at"])
+    assert got > pd.Timestamp.now(tz=A.KST) - pd.Timedelta("1min"), f"사람이 연 포지션을 봇의 옛 진입 시각({got})으로 흡수했다"
+
+def s20():
+    """실주문 모드 시작 시 읽기 전용 계정 점검 — 선물 불가 계정(acctLv=1)·출금 권한 키면 주문 경로에 들어가기 전에 멈춘다."""
+    good, bad1, bad2 = FakeEx(), FakeEx(), FakeEx()
+    bad1.cfg = {**bad1.cfg, "acctLv": "1"}                  # 2026-09-30 실계좌 상태 그대로
+    bad2.cfg = {**bad2.cfg, "perm": "read_only,trade,withdraw"}
+    with patched(A, MODE="live", HAVE_KEYS=True), patched(builtins, input=lambda msg: "실주문"):
+        for ex, should_stop in ((good, False), (bad1, True), (bad2, True)):
+            with patched(X, client=lambda ex=ex: ex):
+                try:
+                    A.confirm_live()
+                    stopped = False
+                except SystemExit:
+                    stopped = True
+            assert stopped == should_stop, f"계정 {ex.cfg} 에서 시작 {'계속' if not stopped else '중단'}"
+            assert not [c for c in ex.calls if c[0] in ("create_order", "set_leverage", "set_position_mode")], ex.calls
+
+
+def s21():
+    """거래소가 응답으로 거절한 주문은 '상태 불명' 이 아니라 거절이다 — 30분 진입 차단·CRITICAL 대상이 아니다."""
+    reset()
+    ex = FakeEx()
+    ex.modes = ["refuse"]
+    c = bars(dip=3)
+    act(ex, c)
+    with A.db() as db:
+        st = db.execute("SELECT status FROM orders WHERE action='open' ORDER BY id DESC LIMIT 1").fetchone()[0]
+    assert st.startswith("rejected"), f"거래소 거절을 '{st}' 로 적었다"
+    assert A.state()["side"] is None and ex.pos == 0
+    act(ex, after(c, (PX, PX, PX * 0.97, PX * 0.97)))       # 다음 봉도 급락 → 미해결 주문이 없으니 바로 다시 낼 수 있다
+    assert len(ex.buys()) == 2 and A.state()["side"] == "long", f"거절된 주문이 진입을 막았다: {ex.buys()}"
+
+
 CASES = [("1", "미완성 신호 봉으로 주문하지 않음", s1), ("2", "진입 전 봉 저가로 손절하지 않음", s2),
          ("2b", "진입 봉의 진입 전 가격으로 익절 기록 안 함", s2b), ("3", "같은 봉 TP/SL → 손절", s3),
          ("4", "갭 손절은 손절선 체결 보장 안 함", s4), ("5", "다운타임 뒤 지난 신호로 진입 안 함", s5),
@@ -451,7 +538,9 @@ CASES = [("1", "미완성 신호 봉으로 주문하지 않음", s1), ("2", "진
          ("11", "일봉 경계 미래정보 없음", s11), ("12", "결측·역순·지연 데이터 처리", s12),
          ("13", "최소 수량·가용 잔고 미달 → 제출 전 차단", s13), ("14", "paper 모드 주문 API 0회", s14),
          ("15", "Claude 장애가 청산을 막지 않음", s15), ("16", "청산 실패 → 다음 사이클 재시도", s16),
-         ("17", "거래소 거부(체결 0)를 성공으로 보지 않음", s17)]
+         ("17", "거래소 거부(체결 0)를 성공으로 보지 않음", s17), ("18", "청산 수량 = 거래소 포지션 전량 (계약 반올림)", s18),
+         ("19", "재시작 흡수 포지션도 다운타임 봉을 판정", s19), ("20", "실주문 시작 전 계정 점검 (acctLv·출금 권한)", s20),
+         ("21", "거래소 거절 ≠ 상태 불명", s21)]
 
 if __name__ == "__main__":
     bad = []

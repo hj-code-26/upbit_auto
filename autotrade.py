@@ -155,6 +155,20 @@ def set_autorun(on):
 
 
 # ---------- 계좌 (모의 장부는 항상, 실계좌는 live 일 때) ----------
+def bot_entry_time(ex, side):
+    """장부에 없는 거래소 포지션이 봇의 마지막 진입 주문에서 온 것이면 그 주문의 의도 기록 시각(KST ISO), 아니면 None.
+    조건: 봇의 실주문 기록(open·close) 중 가장 최근 것이 같은 방향의 open 이고, 거래소 재조회로 체결이 확인된다.
+    체결 뒤 장부 기록 전에 죽고 재시작하면 예전에는 진입 시각을 '지금' 으로 적어 다운타임 중 손절 통과를 못 보고 만기도 밀렸다
+    (2026-09-30 감사 19). 의도 기록은 제출 직전에 적으므로 실제 체결보다 몇 초 이르다 — entry_bar 의 ceil 이 같은 봉으로 맞춘다."""
+    with db() as c:
+        row = c.execute("SELECT action, side, client_id, timestamp FROM orders WHERE mode='live' AND client_id IS NOT NULL "
+                        "AND action IN ('open', 'close') ORDER BY id DESC LIMIT 1").fetchone()
+    if not row or row[0] != "open" or row[1] != side:
+        return None
+    got = X.find_order(ex, row[2])
+    return row[3] if got and got["filled"] > 0 else None
+
+
 def account(ex, px):
     """{equity, pos, paper_equity, paper_pos}. pos = {side, qty, entry, pnl, entered_at, held_days, pnl_pct} | None"""
     st = state()
@@ -167,10 +181,15 @@ def account(ex, px):
     if ex:
         snap = X.snapshot(ex)                                          # 잔고·시세를 한 번에 (폴링 비용 절감)
         eq, pos = snap["equity"], snap["position"]
-        if pos and (pos["side"] != st["side"] or not st["entered_at"]):   # 봇 밖에서 연 포지션 → 모의 장부도 맞추고 오늘 진입으로
-            log.warning("봇 밖에서 연 포지션을 장부에 흡수합니다 (%s %.6f @%s) — 지금부터 익절·손절·만기 규칙으로 봇이 관리합니다",
-                        pos["side"], pos["qty"], f"{pos['entry']:,.1f}")
-            set_state(side=pos["side"], qty=pos["qty"], entry=pos["entry"], entered_at=now())
+        if pos and (pos["side"] != st["side"] or not st["entered_at"]):   # 장부에 없는 포지션 → 흡수
+            t_bot = bot_entry_time(ex, pos["side"])
+            if t_bot:                                                      # 봇이 낸 진입이 체결된 뒤 장부 기록 전에 죽었다
+                log.warning("봇 진입 주문의 체결을 장부에 복구합니다 (%s %.6f @%s, 주문 시각 %s) — 그 뒤 봉부터 익절·손절·만기를 판정합니다",
+                            pos["side"], pos["qty"], f"{pos['entry']:,.1f}", t_bot)
+            else:
+                log.warning("봇 밖에서 연 포지션을 장부에 흡수합니다 (%s %.6f @%s) — 지금부터 익절·손절·만기 규칙으로 봇이 관리합니다",
+                            pos["side"], pos["qty"], f"{pos['entry']:,.1f}")
+            set_state(side=pos["side"], qty=pos["qty"], entry=pos["entry"], entered_at=t_bot or now())
             st = state()
         elif pos:                                                          # 시장가 체결 수량·평단을 거래소 값으로 보정
             set_state(qty=pos["qty"], entry=pos["entry"])
@@ -353,6 +372,13 @@ def execute(ex, run_id, action, side, qty, notional, px, reason, lev=None):
             if got and got["filled"] > 0:
                 fill_qty, fill_px, status = got["filled"], got["avg"] or px, "filled(재조회)"
                 log.warning("주문 예외 뒤 재조회에서 체결 확인: %s %.6f @%s", action, fill_qty, f"{fill_px:,.1f}")
+            elif isinstance(e, (X.ccxt.ExchangeError, ValueError)):
+                # 거래소가 응답으로 거절했거나(ccxt.ExchangeError) 제출 전에 막혔다(ValueError) → 주문이 생기지 않았다는 확정 정보.
+                # 네트워크·타임아웃(ccxt.NetworkError 등)과 달리 '상태 불명' 이 아니다 (2026-09-30 감사 21). 청산이면 다음 사이클이 다시 시도한다.
+                status = f"rejected: {X.explain(e)}"[:200]
+                _order_done(oid, status=status, order_id=ex_id)
+                log.error("주문 거절 (%s %s) — 장부를 바꾸지 않습니다: %s", action, side, X.explain(e))
+                return False
             else:
                 status = f"unknown: {X.explain(e)}"[:200]
                 _order_done(oid, status=status, order_id=ex_id)
@@ -387,6 +413,14 @@ def entry_bar(entered_at):
     그 봉으로 판정하면 가짜 익절·손절이 나온다 (2026-09-28 감사 2b, (a)안). 백테스트('진입 = 그 봉 시가')보다
     판정이 최대 한 봉 늦고 만기도 그만큼 늦다 — 진입 직후 5분 안의 터치는 다음 봉부터 본다."""
     return pd.Timestamp(entered_at).tz_convert("UTC").ceil(S.BAR)
+
+
+def too_small(ex, notional, px):
+    """okx.open_position 이 제출 전에 거부할 크기인가. 진짜 ccxt 는 1 lot 미만이면 0 이 아니라 InvalidOrder 를 던진다."""
+    try:
+        return notional < X.MIN_ORDER or X.contracts(ex, notional / px) <= 0
+    except (X.ccxt.InvalidOrder, ValueError):
+        return True
 
 
 def act(ex, pub, run_id, c5, d1, px, acc, fresh=True):
@@ -433,6 +467,8 @@ def act(ex, pub, run_id, c5, d1, px, acc, fresh=True):
         action, reason = "hold", f"결론 안 난 주문 {pending}건 — 거래소에서 확인될 때까지 신규 진입 안 함 · " + reason
     if action == "open" and ex and notional * (1 / LEVERAGE + X.TAKER_FEE) > acc["cash"]:   # 제출 전 가용 잔고 확인
         action, reason = "hold", f"가용 {acc['cash']:,.2f} USDT < 증거금+수수료 {notional * (1 / LEVERAGE + X.TAKER_FEE):,.2f} → 제출 안 함 · " + reason
+    if action == "open" and ex and too_small(ex, notional, px):   # 제출 전 최소 수량 확인 — execute 는 레버리지 설정부터 바꾼다 (2026-09-30 감사 13)
+        action, reason = "hold", f"명목 {notional:,.2f} USDT 가 최소 주문(명목 {X.MIN_ORDER} · 1 lot) 미만 → 제출 안 함 · " + reason
     if action == "open" and USE_CLAUDE:                          # ← 주문 직전. 거부되면 이번 신호는 끝
         v = claude_gate(review_payload(c5, d1, dev.iloc[-1], bull.iloc[-1], px, acc, notional))
         if v["approve"]:
@@ -533,6 +569,12 @@ def confirm_live():
     msg = f"OKX 실계좌 주문 모드입니다 (MODE={MODE}{', 모의 %d회 완료 후 자동 전환' % LIVE_AFTER if MODE == 'auto' else ''}, {LEVERAGE:g}배). '실주문' 을 입력하면 계속합니다: "
     if input(msg).strip() != "실주문":
         sys.exit("취소")
+    try:                                                     # 읽기 전용 계정 점검 — 주문 경로에 들어가기 전에 멈춘다 (2026-09-30 감사 20)
+        bad = X.account_problems(X.client())
+    except Exception as e:  # noqa: BLE001
+        sys.exit(f"OKX 계정 점검 실패 — 주문 모드로 시작하지 않습니다: {X.explain(e)}")
+    if bad:
+        sys.exit("실주문 불가:\n  - " + "\n  - ".join(bad))
 
 
 _LOCK = None

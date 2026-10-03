@@ -157,9 +157,24 @@ def verify_setup(ex, leverage):
     return out
 
 
+def account_problems(ex):
+    """봇이 고칠 수 없는 계정 문제 (읽기 전용 — 설정을 바꾸지 않는다) → 문장 목록, 비면 통과.
+    레버리지·포지션 모드는 setup() 이 진입 때 맞추므로 여기서 안 본다. 2026-09-30 감사: 실계좌가 acctLv=1(현물 모드)이라
+    선물 주문이 전부 거부되는데, 봇은 신호마다 그걸 '상태 불명' 으로 적고 있었을 것이다."""
+    c = ex.private_get_account_config()["data"][0]
+    bad = []
+    if str(c.get("acctLv")) not in ("2", "3", "4"):
+        bad.append(f"계정 모드 acctLv={c.get('acctLv')} — 1 은 현물 모드라 무기한 선물을 못 산다 (OKX 웹 > 거래 설정 > 계정 모드에서 사용자가 바꿔야 함)")
+    if "withdraw" in str(c.get("perm", "")):
+        bad.append("API 키에 출금 권한이 있다 — 출금 권한 없는 키로 바꿀 것")
+    return bad
+
+
 def contracts(ex, qty_btc):
-    """BTC 수량 → 계약 수 (거래소 정밀도로 내림)."""
-    return float(ex.amount_to_precision(SYMBOL, qty_btc / float(market(ex)["contractSize"])))
+    """BTC 수량 → 계약 수 (거래소 정밀도로 내림).
+    나눗셈의 float 오차를 먼저 걷어낸다: 0.03계약 포지션은 BTC 로 0.00030000000000000003 이고 다시 나누면
+    0.029999999999999995 → 내림 0.02 → 청산 주문이 한 lot 모자라 잔량이 남았다 (2026-09-30 감사 18, 0.01~30계약 중 7%)."""
+    return float(ex.amount_to_precision(SYMBOL, round(qty_btc / float(market(ex)["contractSize"]), 8)))
 
 
 def open_position(ex, side, notional, px, cid=None):
