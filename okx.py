@@ -3,7 +3,7 @@
 
   Client : 실거래 / 데모 거래(x-simulated-trading: 1)
   Paper  : dry-run. 시세는 공개 API, 주문·포지션·손절은 장부에서. sync() 가 지난 실행 이후의
-           확정 1H 봉으로 펀딩과 손절·강제청산(가까운 쪽 먼저) 체결을 재생한다. Client 와 같은 메서드를 가진다.
+           확정 1H 봉으로 펀딩과 손절·강제청산(가까운 쪽 먼저) 체결을 재생한다 (매시 실행이라 보통 1봉). Client 와 같은 메서드를 가진다.
 재시도: GET 은 지수 백오프. 주문 POST 는 재전송 전에 반드시 clOrdId/algoClOrdId 로 이미 접수됐는지 조회한다.
 """
 import base64
@@ -297,10 +297,10 @@ class Paper:
         else:
             ct = self.instrument(inst)["ctVal"]
             fee, lv = -self.FEE * sz * ct * px, self.st["lever"].get(inst, rls.LEVER)
-            # ponytail: 청산가 = 진입가 ∓ (1/lever − MMR) 단일 구간 근사. 실제는 OKX 유지증거금 티어·수수료 반영
+            # ponytail: 청산가 = 진입가 ∓ (1/lever − MMR − taker) 단일 구간 근사. 실제 티어는 데모에서 확인
             self.st["pos"][inst] = {"side": side, "sz": sz, "avgPx": px, "fee": fee, "fundingFee": 0.0,
                                     "margin": sz * ct * px / lv, "mgnMode": "isolated", "t": now, "lever": lv,
-                                    "liqPx": px * (1 - side * (1 / lv - rls.MMR))}
+                                    "liqPx": px * (1 - side * rls.liq_dist(lv))}
         o = {"cid": cid, "state": "filled", "avgPx": px, "sz": sz, "fee": fee}
         self.st["orders"][cid] = o
         return o
@@ -308,7 +308,7 @@ class Paper:
     def sync(self):
         """보유 포지션마다 마지막 처리 이후의 확정 1H 봉을 순서대로: 펀딩 → 손절/강제청산 중 가까운 쪽
         (시가 갭이면 시가, 아니면 트리거가) 체결. 강제청산은 type 3, 손실은 증거금으로 상한."""
-        # ponytail: 진입 봉(00:00~00:05)의 저가도 손절 판정에 쓴다. 3×ATR 거리라 오판 가능성은 무시할 수준.
+        # ponytail: 진입 봉(HH:00~HH:02)의 고저도 손절 판정에 쓴다. 2분 구간이라 오판 가능성은 작다. 1분봉이면 정확.
         for inst, p in list(self.st["pos"].items()):
             ct = self.instrument(inst)["ctVal"]
             bars = self.candles(inst, p["t"] - p["t"] % 3_600_000)

@@ -1,12 +1,9 @@
-"""과거 리플레이 (명세 검증 체크리스트 1번). OKX 1H 봉 2020-01-01~ → UTC 일봉 → rls.simulate.
-연구 수치(증거금 2% 격리, 펀딩 0.01%/8h 가정, 수익 / MDD / Sharpe / 거래 / 강제청산 / 손절):
-  BTC 10x +50.5% / 12.8% / 0.65 / 88 / 10 / 2     5x +37.1% / 7.6% / 0.75 / 88 / 1 / 7
-  ETH 10x +99.1% / 23.9% / 0.80 / 76 / 13 / 0     5x +41.9% / 12.8% / 0.69 / 75 / 2 / 1
-청산 건수는 ATR 방식 차이로 ±1~2건, 2024-10 이전은 last price 근사(OKX 실제는 mark price).
-"10x B안" 은 검증 안 된 변형(손절 = min(3×ATR, 청산 거리 − 1.5%p)) — A안과 따로 본다.
+"""과거 리플레이 (명세 검증 체크리스트 1). OKX 1H 봉 2020-01-01~ → rls.simulate (종목별 독립 계좌) → 일수익 합산.
+명세 수치(증거금 4% 격리 20x, BTC+ETH 합산): CAGR 30.9% / MDD 19.0% / Sharpe 1.15 / 최악 주 −7.8% / 강제청산 0,
+거래 119 (BTC 60, ETH 59), 승률 38.7% (BTC 41.7%, ETH 35.6%). 연구 엔진은 SMA14 ATR 이라 'ATR=sma' 행이 이에 가깝다.
 1H 봉은 data_cache/ 에 저장하고 다음 실행 때 이어 받는다.
 사용: python backtest.py               2020-01-01 부터
-      python backtest.py 2023-01-01    그날부터 거래 (이전 일봉은 레짐 워밍업에만)
+      python backtest.py 2023-01-01    그날부터 거래 (이전 봉은 워밍업에만, 진행 중 레짐은 건너뜀)
 """
 import pathlib
 import sys
@@ -20,6 +17,7 @@ import rls
 
 CACHE = pathlib.Path(__file__).resolve().parent / "data_cache"
 START = int(pd.Timestamp("2020-01-01").timestamp() * 1000)
+INSTS = ("BTC-USDT-SWAP", "ETH-USDT-SWAP")
 
 
 def history(inst):
@@ -33,29 +31,46 @@ def history(inst):
     return df
 
 
-def stats(eq, trades):
+def stats(eq, trades=None):
+    """eq: 일별 자산. 일별 Sharpe(√365), 최악 주, 연도별, 거래·승률·강제청산·최장 연패."""
     r = eq.pct_change().dropna()
+    yrs = (eq.index[-1] - eq.index[0]).days / 365.25
     ye = eq.groupby(eq.index.year).last()
-    yearly = ye / ye.shift(fill_value=1.0) - 1
-    return {"ret%": (eq.iloc[-1] - 1) * 100, "mdd%": (1 - eq / eq.cummax()).max() * 100,
-            "sharpe": r.mean() / r.std() * np.sqrt(365) if r.std() else 0.0, "trades": len(trades),
-            "win%": (trades.ret > 0).mean() * 100 if len(trades) else 0.0, "yearly": yearly,
-            "liq": int((trades.why == "liq").sum()) if len(trades) else 0,
-            "stop": int((trades.why == "stop").sum()) if len(trades) else 0}
+    out = {"cagr%": ((eq.iloc[-1] / eq.iloc[0]) ** (1 / yrs) - 1) * 100, "mdd%": (1 - eq / eq.cummax()).max() * 100,
+           "sharpe": r.mean() / r.std() * np.sqrt(365) if r.std() else 0.0,
+           "worst_wk%": eq.resample("W").last().pct_change().min() * 100,
+           "yearly": ye / ye.shift(fill_value=eq.iloc[0]) - 1}
+    if trades is not None and len(trades):
+        loss = trades.pnl <= 0
+        out.update(trades=len(trades), win=(~loss).mean() * 100, liq=int((trades.why == "liq").sum()),
+                   streak=int(loss.groupby((~loss).cumsum()).sum().max()))
+    return out
+
+
+def line(name, s):
+    t = (f"  거래 {s['trades']}  승률 {s['win']:.1f}%  청산 {s['liq']}  최장연패 {s['streak']}" if "trades" in s else "")
+    return (f"  {name:18s} CAGR {s['cagr%']:+5.1f}%  MDD {s['mdd%']:4.1f}%  Sharpe {s['sharpe']:.2f}  "
+            f"최악 주 {s['worst_wk%']:+.1f}%{t}\n{'':22s}" + " ".join(f"{y}:{v * 100:+.1f}" for y, v in s["yearly"].items()))
 
 
 if __name__ == "__main__":
     start = pd.Timestamp(sys.argv[1]) if len(sys.argv) > 1 else None
-    for inst in ("BTC-USDT-SWAP", "ETH-USDT-SWAP"):
-        t = time.time()
-        d = rls.daily(history(inst))
-        print(f"\n== {inst}  일봉 {len(d)}개 {d.index[0].date()}~{d.index[-1].date()}  ({time.time() - t:.0f}s)")
-        for name, kw in [("10x A안", {}), ("10x B안", {"stop_mode": "B"}), ("10x 펀딩0", {"funding_8h": 0}),
-                         ("5x", {"lever": 5}), ("R4 롱만", {"allow": (1,)})]:
-            s = stats(*rls.simulate(d, start=start, **kw))
-            print(f"  {name:9s} 수익 {s['ret%']:+6.1f}%  MDD {s['mdd%']:4.1f}%  Sharpe {s['sharpe']:.2f}  "
-                  f"거래 {s['trades']}  청산 {s['liq']}  손절 {s['stop']}  승률 {s['win%']:.0f}%  연도별 "
-                  + " ".join(f"{y}:{v * 100:+.1f}" for y, v in s["yearly"].items()))
+    t = time.time()
+    H = {i: history(i) for i in INSTS}
+    print(f"1H 봉 {', '.join(f'{i[:3]} {len(h)}개' for i, h in H.items())} ~{pd.Timestamp(max(h.ts.max() for h in H.values()), unit='ms')} "
+          f"({time.time() - t:.0f}s)")
+    for name, kw in [("20x (명세, Wilder)", {}), ("20x ATR=sma", {"atr_kind": "sma"}), ("10x", {"lever": 10}),
+                     ("7x", {"lever": 7}), ("20x 펀딩0", {"funding_8h": 0})]:
+        R = {i: rls.simulate(h, start=start, **kw) for i, h in H.items()}
+        print(line(name, stats(rls.portfolio([e for e, _ in R.values()]), pd.concat([tr for _, tr in R.values()]))))
+        if not kw:
+            for i, (e, tr) in R.items():
+                s = stats(e.groupby(e.index.normalize()).last(), tr)
+                print(f"      {i[:3]} 거래 {s['trades']}  승률 {s['win']:.1f}%  청산 {s['liq']}  최장연패 {s['streak']}  "
+                      f"사유 {tr.why.value_counts().to_dict()}  손실 중앙 {tr.pnl_pct[tr.pnl <= 0].median() * 100:+.1f}%  "
+                      f"이익 중앙 {tr.pnl_pct[tr.pnl > 0].median() * 100:+.1f}%")
+    D = {i: rls.daily(h) for i, h in H.items()}
+    print(line("RLS 5x 2% (FWD-v2)", stats(rls.portfolio([rls.simulate_rls5(d, start=start) for d in D.values()]))))
+    for i, d in D.items():
         c = d.close[d.index >= start] if start is not None else d.close
-        bh = c / c.iloc[0]
-        print(f"  1x 매수보유 수익 {(bh.iloc[-1] - 1) * 100:+.0f}%  Sharpe {stats(bh, pd.DataFrame())['sharpe']:.2f}")
+        print(line(f"1x 매수보유 {i[:3]}", stats(c / c.iloc[0])))
