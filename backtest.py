@@ -335,6 +335,132 @@ def coin_validation(start=START, end=END):
     return out
 
 
+# ---------- 계좌 단위 리플레이 (운용과 같은 구조) ----------
+INST_META = {"BTC-USDT-SWAP": (0.01, 0.01, 0.01), "ETH-USDT-SWAP": (0.1, 0.01, 0.01)}   # ctVal, lotSz, minSz
+
+
+def account_replay(H, offs, start, end=None, margin=rls.MARGIN, lever_=rls.LEVER, capital=None, mmr=rls.SIM_MMR["coin"],
+                   slip=rls.SLIP, funding_8h=rls.FUNDING_8H, size_buf=0.001):
+    """한 계좌 1H 리플레이 — simulate_tranches(몫마다 독립 자본·독립 일손실) 와 달리 autotrade 와 같은 구조:
+    몫 증거금 = 실현 잔고 × margin / 몫 수, 동시 증거금 ≤ 일 기준 자산 10%, 일손실 = UTC 날 경계에서 일 기준 대비 −5%
+    → 전량 청산·그날 진입 없음, 킬 = 일별 고점 대비 −35% (매시 종가로 판정) → 전량 청산·정지, 몫별 20연패 → 진입 중단.
+    몫 작업 = 몫 경계 시각 1H 봉 시가 (운용 HH:02 시장가), 손절 = 1H 고저 (시가가 넘으면 시가, 청산가 넘으면 증거금 손실),
+    펀딩 = UTC 00·08·16 고정률. capital 을 주면 그 USDT 로 시작해 수량을 lot 단위로 내림하고 최소 수량 미만이면 건너뛴다.
+    → (UTC 00:00 자산 Series [시작 = 1], 거래 DataFrame, {"below_min": 건수, "cap_block": 건수, "open": 끝에 열린 포지션}).
+    ponytail: 킬은 매시 종가로만 판정 (운용은 5초) — 시간 내 급락은 다음 판정까지 늦게 잡힌다."""
+    N, start = len(offs), pd.Timestamp(start)
+    X = {(i, off): rls.prep(rls.offset_daily(h, off, 1)) for i, h in H.items() for off in offs}
+    B = {}
+    for i, h in H.items():
+        b = h[h.confirm == 1]
+        B[i] = pd.DataFrame({"o": b.open.to_numpy(), "h": b.high.to_numpy(), "l": b.low.to_numpy(), "c": b.close.to_numpy()},
+                            index=pd.to_datetime(b.ts.astype("int64"), unit="ms")).astype(float)
+    clock = sorted(set.intersection(*(set(b.index) for b in B.values())))
+    clock = [t for t in clock if t >= start and (end is None or t < pd.Timestamp(end) + pd.Timedelta(days=1))]
+    cash = float(capital or 1.0)
+    pos, blk, streak, trades, eqs = {}, {}, [0] * N, [], {}
+    day_ref = hwm = None
+    dl_day, halted, hold = None, False, False
+    cnt = {"below_min": 0, "cap_block": 0}
+
+    def mark(px):
+        return cash + sum(p["side"] * p["qty"] * (px[p["i"]] - p["entry"]) for p in pos.values())
+
+    def close(key, px, why, t):
+        nonlocal cash, hold
+        p = pos.pop(key)
+        i, k = key
+        if why == "liq":
+            fill, gross, fee = px, -p["margin"], 0.0
+        else:
+            fill = px * (1 - p["side"] * slip)
+            gross, fee = p["side"] * p["qty"] * (fill - p["entry"]), rls.TAKER * p["qty"] * fill
+        cash += gross - fee
+        pnl = gross - fee - p["fee"] + p["fund"]
+        if rls.edge_after(why, p["be"]):
+            blk[key] = p["side"]
+        streak[k] = streak[k] + 1 if pnl <= 0 else 0
+        hold = hold or streak[k] >= rls.STREAK_HOLD
+        trades.append({"sleeve": "coin", "tranche": k, "inst": i, "side": p["side"], "entry_ts": p["t0"], "exit_ts": t, "entry": p["entry"],
+                       "exit": fill, "be": p["be"], "why": why, "pnl": pnl, "pnl_pct": pnl / p["eq0"]})
+
+    for t in clock:
+        o = {i: B[i].at[t, "o"] for i in B}
+        for key in list(pos):                                # 1) 시가 갭: 손절·청산가 너머로 열리면 시가 체결
+            p = pos[key]
+            if (o[key[0]] - p["stop"]) * p["side"] <= 0:
+                close(key, o[key[0]], "liq" if (o[key[0]] - p["liq"]) * p["side"] <= 0 else "sl", t)
+        if t.hour == 0:                                      # 2) UTC 날 경계: 자산 기록 → 일손실 판정 → 새 일 기준 · 일별 고점
+            eq = mark(o)
+            eqs[t] = eq
+            if day_ref and eq <= day_ref * (1 - rls.DAILY_LOSS):
+                dl_day = t.date()
+                for key in list(pos):
+                    close(key, o[key[0]], "daily_loss", t)
+                eq = cash
+            day_ref, hwm = eq, max(hwm or eq, eq)
+        if t.hour % 8 == 0:                                  # 3) 펀딩 (UTC 00·08·16)
+            for p in pos.values():
+                f = rls.funding_pnl(p["side"], funding_8h, p["qty"] * o[p["i"]])
+                cash += f
+                p["fund"] += f
+        for k, off in enumerate(offs):                       # 4) 몫 작업: 방금 끝난 off 경계 일봉으로 판단, 이 봉 시가에 체결
+            if t.hour != off:
+                continue
+            for i in H:
+                x = X[(i, off)]
+                sd = t - pd.Timedelta(days=1)
+                if sd not in x.index or np.isnan(x.at[sd, "atr"]):
+                    continue
+                sig, key = x.loc[sd], (i, k)
+                p = pos.get(key)
+                if p:
+                    why = "regime" if sig.conf != p["side"] else "drop1" if rls.drop1(p["side"], sig.close, sig.prev, sig.atr) else None
+                    if why:
+                        close(key, o[i], why, t)
+                if blk.get(key) and sig.conf != blk[key]:
+                    del blk[key]
+                p = pos.get(key)
+                if not p and sig.conf and sig.conf != blk.get(key) and rls.vol_ok(sig.atr, sig.close) \
+                        and not halted and not hold and dl_day != t.date():
+                    m_amt = cash * margin / N
+                    if sum(q["margin"] for q in pos.values()) + m_amt > rls.MAX_TOTAL * day_ref + 1e-12:
+                        cnt["cap_block"] += 1
+                        continue
+                    side, fill = int(sig.conf), o[i] * (1 + int(sig.conf) * slip)
+                    if capital:
+                        ct, lot, mn = INST_META[i]
+                        sz = okx.floor_to(m_amt * lever_ / (ct * o[i] * (1 + size_buf)), lot)
+                        if sz < mn:
+                            cnt["below_min"] += 1
+                            continue
+                        qty = sz * ct
+                    else:
+                        qty = m_amt * lever_ / fill
+                    dist = rls.stop_dist(sig.atr, sig.close, lever_, mmr)
+                    fee = rls.TAKER * qty * fill
+                    eq0 = mark(o)
+                    cash -= fee
+                    pos[key] = {"i": i, "side": side, "entry": fill, "qty": qty, "margin": qty * fill / lever_,
+                                "stop": rls.stop_px(side, fill, dist), "liq": fill * (1 - side * rls.liq_dist(lever_, mmr)),
+                                "atr_e": sig.atr, "be": False, "t0": t, "eq0": eq0, "fee": fee, "fund": 0.0}
+                elif p and not p["be"] and rls.be_hit(p["side"], sig.close, p["entry"], p["atr_e"]):
+                    p["stop"], p["be"] = rls.tighten(p["side"], p["stop"], rls.be_px(p["side"], p["entry"])), True
+        for key in list(pos):                                # 5) 장중 손절 (1H 고저)
+            p, b = pos[key], B[key[0]].loc[t]
+            if (b.l <= p["stop"]) if p["side"] > 0 else (b.h >= p["stop"]):
+                close(key, p["stop"], "sl", t)
+        c = {i: B[i].at[t, "c"] for i in B}                  # 6) 킬: 매시 종가 자산 vs 일별 고점
+        if hwm and not halted and 1 - mark(c) / hwm >= rls.KILL_DD:
+            halted = True
+            for key in list(pos):
+                close(key, c[key[0]], "halt", t)
+    cnt["open"] = [{"tranche": k, "inst": i, "side": p["side"], "entry_ts": p["t0"], "entry": p["entry"], "be": p["be"],
+                    "stop": p["stop"]} for (i, k), p in pos.items()]
+    e = pd.Series(eqs)
+    return e / e.iloc[0], pd.DataFrame(trades), cnt
+
+
 if __name__ == "__main__" and "--coin" in sys.argv:
     args = [a for a in sys.argv[1:] if a != "--coin"]
     coin_validation(*(args + [START, END])[:2])

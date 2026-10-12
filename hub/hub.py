@@ -91,14 +91,19 @@ def coin():
         "account": {f"OKX{' 데모' if o.get('demo') else ''} 자산 (USDT)": o.get("eq"), "가용 (USDT)": o.get("avail"),
                     "실현 잔고 (USDT)": o.get("realized"), "잔액 조회 (UTC)": o.get("ts"),
                     "장부 자산": last.get("equity"), "낙폭 %": last["dd"] * 100 if isinstance(last.get("dd"), (int, float)) else None,
-                    "연패": a.get("streak"), "상태": coin_state(d(s.get("risk")), a, s)},
+                    "연패": a.get("streak"), "상태": coin_state(d(s.get("risk")), a, s),
+                    "실거래 검증": d(s.get("forward")).get("summary")},
         "tables": [
             {"title": "보유 포지션 (상품#몫)", "rows": held, "cols": ["pos", "side", "sz", "entry", "stop", "be_ts"]},
             {"title": "최근 거래 (청산 완료, UTC)", "rows": pct(lst(s.get("trades"))[:50], "pnl_pct"),
              "cols": ["inst", "side", "entry_ts", "entry_px", "exit_ts", "exit_px", "why", "pnl", "pnl_pct"]},
             {"title": "최근 주문 (UTC)", "rows": lst(s.get("orders"))[:50],
              "cols": ["ts", "inst", "action", "side", "sz", "avg_px", "state"]}],
-        "errors": [err] if err else []}
+        "errors": ([err] if err else []) + [f"검증: {f}" for f in lst_str(d(s.get("forward")).get("flags"))]}
+
+
+def lst_str(x):
+    return [str(v) for v in x] if isinstance(x, list) else []
 
 
 API = {"/api/stock": stock, "/api/coin": coin}

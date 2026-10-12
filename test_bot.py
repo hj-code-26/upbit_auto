@@ -560,6 +560,35 @@ def test_streak_per_tranche():
     assert A.count_streak(a, 0, True) == A.STREAK_HOLD and a["streak"] == 20
 
 
+def test_account_replay():
+    """계좌 단위 리플레이: 꾸준한 상승 → 확정 BULL 롱 보유로 자산 증가. 시작 자본이 최소 수량에 못 미치면 진입 없이 below_min."""
+    import backtest
+    t = pd.date_range("2025-01-01", periods=200 * 24, freq="h")
+    px = np.linspace(100, 200, len(t))
+    h = pd.DataFrame({"ts": t.as_unit("ms").astype("int64"), "open": px, "high": px * 1.001, "low": px * 0.999, "close": px, "confirm": 1})
+    e, tr, c = backtest.account_replay({ETH: h}, (0, 8, 16), "2025-04-01", margin=0.04, capital=1000)
+    assert e.iloc[0] == 1 and e.iloc[-1] > 1.1 and c["below_min"] == 0
+    e, tr, c = backtest.account_replay({ETH: h}, (0, 8, 16), "2025-04-01", margin=0.04, capital=0.01)
+    assert c["below_min"] > 0 and len(tr) == 0 and abs(e.iloc[-1] - 1) < 1e-12
+
+
+def test_forward_match():
+    """실거래 검증: 같은 몫·방향·진입(±1시간)·사유면 일치, 사유가 다르면 내용 불일치, 리플레이만의 진입은
+    운용 잔고로 최소 수량 미달이면 '예상된 건너뜀', 아니면 '리플레이만 진입'."""
+    import forward
+    cfg = {"margin_per_symbol": 0.04, "tranches_utc": [0, 8, 16], "lever": 30}
+    t0, since = pd.Timestamp("2026-10-15 00:00"), pd.Timestamp("2026-10-12 04:35")
+    rep = [{"inst": ETH, "tranche": 0, "side": 1, "entry_ts": t0, "entry": 2560.0, "exit": 2512.0, "why": "sl"},
+           {"inst": ETH, "tranche": 1, "side": 1, "entry_ts": t0 + pd.Timedelta(hours=8), "entry": 2570.0, "exit": None, "why": None},
+           {"inst": ETH, "tranche": 2, "side": 1, "entry_ts": t0 + pd.Timedelta(hours=16), "entry": 2580.0, "exit": None, "why": None}]
+    live = [{"inst": ETH, "tranche": 0, "side": 1, "entry_ts": "2026-10-15T00:02", "entry": 2561.0, "exit": 2511.0, "why": "sl"},
+            {"inst": ETH, "tranche": 1, "side": 1, "entry_ts": "2026-10-15T08:02", "entry": 2571.0, "exit": 2600.0, "why": "drop1"}]
+    ok, mis = forward.match(live, rep, since, lambda t: 7.28, cfg, lambda R: R["entry"])
+    assert ok == 1 and [m["kind"] for m in mis] == ["내용 불일치", "리플레이만 진입"], mis
+    ok, mis = forward.match([], rep[2:], since, lambda t: 5.0, cfg, lambda R: R["entry"])
+    assert mis[0]["kind"].startswith("예상된 건너뜀"), mis
+
+
 def test_one_tranche_env():
     """RLSC_TRANCHES=0 → 1몫: 몫 증거금 = 실현 잔고 2% 전부, 작업은 t0 + guard 만."""
     import importlib

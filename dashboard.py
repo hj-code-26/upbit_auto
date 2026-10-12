@@ -45,7 +45,15 @@ def api_state():
             "trades": rows("SELECT * FROM trades ORDER BY exit_ts DESC LIMIT 200"),
             "orders": rows("SELECT * FROM orders ORDER BY ts DESC LIMIT 100"),
             "acct": A.kv_get("acct", {}), "regimes": A.kv_get("regimes", {}), "okx": A.kv_get("okx_balance"), "tranches": A.TRANCHES,
-            "ledger": {A.tkey(i, k): A.ledger(i, k) for i in A.COINS for k in range(A.N)}}
+            "ledger": {A.tkey(i, k): A.ledger(i, k) for i in A.COINS for k in range(A.N)}, "forward": forward_json()}
+
+
+def forward_json():
+    """forward.py 결과 (실거래 vs 리플레이). 없거나 깨졌으면 None."""
+    try:
+        return json.loads((A.ROOT / "forward.json").read_text())
+    except (OSError, ValueError):
+        return None
 
 
 PAGE = r"""<!doctype html><html lang=ko><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
@@ -73,6 +81,7 @@ async function load(){
   const o=s.okx;
   document.getElementById('now').innerHTML=`<p><b>위험 상태: ${R.label}</b>${R.err?` · 오류: ${R.err}`:''}<br>신규 진입: ${R.entry_blocks.length?'<span class=f>차단</span> — '+R.entry_blocks.join(' · '):'가능'}`+
     `<br>청산 사유: ${Object.entries(R.flatten).map(([k,v])=>k+' '+v).join(' · ')||'없음'} · 일 기준 ${R.day?f(R.day.eq)+' ('+R.day.date+')':'-'} · 고점 ${f(R.hwm)}`+
+    `<br>실거래 검증: ${s.forward?`${s.forward.summary} (${s.forward.ts.slice(0,16)} UTC 기준)`+(s.forward.flags.length?'<br><span class=f>'+s.forward.flags.join('<br>')+'</span>':''):'아직 없음 (forward.py)'}`+
     `<br><span style="color:var(--t3)">마지막 조회 ${R.t.last_ok||'-'} · 감지 ${R.t.detected||'-'} · 청산 요청 ${R.t.flatten_req||'-'} · flat 확인 ${R.t.flat_ok||'-'}</span></p>`+
     `<p>설정 ${c.strategy_hash} · 몫 ${st.tranches_utc.length} · ${st.lever}x · 종목당 증거금 ${(st.margin_per_symbol*100).toFixed(1)}% (몫당 ${(st.margin_per_tranche*100).toFixed(2)}%) · 신호 ${st.signal.ver} · 위험 ${st.risk.ver} · 코드 ${c.code.git}${c.code.dirty?' (미커밋 변경 있음)':''} / ${c.code.files_sha}<br>`+
     (bt?`같은 설정 백테스트 [${bt.run}] ${bt.period}: CAGR ${bt.stats['cagr%'].toFixed(1)}% · MDD ${bt.stats['mdd%'].toFixed(1)}% · 거래 ${bt.stats.trades} (과거 리플레이, 수익 보장 아님)`:'<span class=f>이 설정과 해시가 같은 백테스트가 없음 — 다른 구성(예: 3몫) 수치를 이 계정 성과로 보지 말 것</span>')+'</p>'+`<p><b>OKX${o?.demo?' 데모':''} 잔액: ${o?f(o.eq)+' USDT':'키 없음/조회 전'}</b>${o?` (가용 ${f(o.avail)}, 실현 ${f(o.realized)}, ${o.ts.slice(0,16).replace('T',' ')} UTC)`:''}${s.mode==='dry'?' · 매매 장부는 dry 가상 자본':''}</p><p>시각 분할 ${s.tranches.length}몫: ${s.tranches.map((h,k)=>`#${k} UTC ${String(h).padStart(2,'0')} (KST ${String((h+9)%24).padStart(2,'0')})`).join(' · ')}</p>`+
