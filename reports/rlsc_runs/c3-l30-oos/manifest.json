@@ -1,0 +1,233 @@
+{
+ "run": "c3-l30-oos",
+ "period": "2023-07-01 ~ 2026-10-09",
+ "strategy": {
+  "insts": [
+   "BTC-USDT-SWAP",
+   "ETH-USDT-SWAP"
+  ],
+  "tranches_utc": [
+   0,
+   8,
+   16
+  ],
+  "lever": 30,
+  "margin_per_symbol": 0.02,
+  "margin_per_tranche": 0.006666666666666667,
+  "max_total_margin": 0.1,
+  "signal": {
+   "ver": "RLS-C1",
+   "sma": 50,
+   "slope": 20,
+   "conf": 3,
+   "atr": "wilder14",
+   "sl_atr": 1.5,
+   "liq_buf": 0.01,
+   "be_atr": 1.0,
+   "be_off": 0.0015,
+   "drop_atr": 1.0,
+   "edge_why": [
+    "sl",
+    "liq",
+    "drop1"
+   ],
+   "bar": "4H confirmed -> 24h at tranche boundary"
+  },
+  "risk": {
+   "ver": "R2",
+   "kill_dd": 0.35,
+   "daily_loss": 0.05,
+   "daily_ref": "UTC 00:00 record",
+   "streak_hold": 20,
+   "anomaly": 0.03,
+   "stop_trigger": "last"
+  },
+  "cost": {
+   "taker": 0.0005,
+   "slip_one_way": 0.0002,
+   "funding_8h": 0.0001,
+   "funding_model": "constant, sign by side"
+  }
+ },
+ "strategy_hash": "1ccafa2906b7",
+ "kw": {},
+ "lever": 30,
+ "tranches_utc": [
+  0,
+  8,
+  16
+ ],
+ "stats": {
+  "cagr%": 37.08240491434973,
+  "mdd%": 18.937589782303334,
+  "sharpe": 1.81211462238847,
+  "worst_wk%": -5.6402626640415505,
+  "worst_mo%": -3.0445874958258567,
+  "pos_mo%": 48.717948717948715,
+  "trades": 164.0,
+  "by": {
+   "coin": 164
+  },
+  "win": 29.268292682926827,
+  "pf": 3.487933624895923,
+  "liq": 0.0,
+  "streak": 22.0,
+  "loss_med": -1.2012031129999978,
+  "loss_min": -1.2922632099603757,
+  "ex_top10": 1.3118418541622332,
+  "why": {
+   "sl": 114,
+   "drop1": 21,
+   "daily_loss": 16,
+   "regime": 13
+  },
+  "yearly%": {
+   "2023": 21.28,
+   "2024": 47.57,
+   "2025": 22.88,
+   "2026": 27.73
+  },
+  "longest_underwater_days": 488,
+  "current_underwater_days": 17
+ },
+ "trades_stats": {
+  "trades": 164,
+  "by_inst": {
+   "BTC-USDT-SWAP": 86,
+   "ETH-USDT-SWAP": 78
+  },
+  "win%": 29.268292682926827,
+  "pf": 3.4879336248959234,
+  "net_pnl_acct": 1.697910083760028,
+  "max_loss_streak": 22,
+  "why": {
+   "sl": 114,
+   "drop1": 21,
+   "daily_loss": 16,
+   "regime": 13
+  },
+  "cap_bound%": 100.0,
+  "be_moved%": 35.36585365853659,
+  "top1_share%": 12.372303843861507,
+  "top3_share%": 31.26893164848108,
+  "top5_share%": 45.83822223515931,
+  "top_abs": [
+   0.2100705945583541,
+   0.17389965927810327,
+   0.1469480897071336,
+   0.13379339456774889,
+   0.11358005943576129
+  ],
+  "by_year": {
+   "2023": 0.21245,
+   "2024": 0.56404,
+   "2025": 0.39144,
+   "2026": 0.52998
+  },
+  "by_inst_pnl": {
+   "BTC-USDT-SWAP": 0.64317,
+   "ETH-USDT-SWAP": 1.05474
+  },
+  "by_side_pnl": {
+   "-1": 0.1769,
+   "1": 1.52101
+  },
+  "same_side_overlap_days%": 57.56358768406962,
+  "avg_hold_days": 8.25609756097561
+ },
+ "rolling_30d": {
+  "windows": 1167,
+  "first_start": "2023-07-01",
+  "last_start": "2026-09-09",
+  "median%": 0.0,
+  "p5%": -3.1331659151640934,
+  "p25%": -1.4488080908413248,
+  "p75%": 3.3640529875321845,
+  "p95%": 18.74146493265523,
+  "min%": -13.986462001556133,
+  "max%": 54.28237937935425,
+  "loss_frac%": 47.90059982862039,
+  "mdd_in_window_med%": 2.3802728927683425,
+  "mdd_in_window_max%": 13.986462001556133,
+  "no_new_entry_frac%": 23.479005998286205,
+  "note": "겹치는 창 — 독립 표본이 아니다 (신뢰구간 계산 안 함)"
+ },
+ "rolling_90d": {
+  "windows": 1107,
+  "first_start": "2023-07-01",
+  "last_start": "2026-07-11",
+  "median%": 3.7179939248805027,
+  "p5%": -4.879911105771417,
+  "p25%": -2.4086391811484753,
+  "p75%": 16.384958876188282,
+  "p95%": 35.94455176540372,
+  "min%": -15.85483803369877,
+  "max%": 58.35057177808134,
+  "loss_frac%": 39.656729900632335,
+  "mdd_in_window_med%": 5.228909697732808,
+  "mdd_in_window_max%": 15.930298735480019,
+  "no_new_entry_frac%": 0.36133694670280037,
+  "note": "겹치는 창 — 독립 표본이 아니다 (신뢰구간 계산 안 함)"
+ },
+ "stop_fill_1h": {
+  "sl_trades": 114,
+  "hourly_gap_through": 0,
+  "extra_loss_sum_pct_of_notional": 0.0,
+  "liq_reached_same_hour": 26
+ },
+ "exposure": {
+  "margin_per_symbol": 0.02,
+  "margin_per_tranche": 0.006666666666666667,
+  "notional_per_symbol_full": 0.6,
+  "notional_gross_full_2coins": 1.2,
+  "stop_cap": 0.018833333333333334,
+  "atr_over_px_cap_binds_above": 0.012555555555555556
+ },
+ "assumptions": [
+  "일봉 근사: 몫 경계 시각 시가 체결 (운용은 HH:02 시장가 — 2분 차이 미반영, 슬리피지 스트레스로 대신)",
+  "손절: 일봉 고저가 손절가를 넘으면 손절가 체결, 시가 갭이면 시가 (1H 갭은 stop_fill_1h 진단)",
+  "강제청산: last 가격 = mark 가정, 티어1 MMR 0.4% 고정 — 청산 안전성 검증 완료 아님",
+  "펀딩: 8시간 0.01% 고정 (과거 실제 펀딩 아님), 부호대로 지급/수취",
+  "몫마다 독립 자본·독립 일손실·독립 킬 (운용은 계좌 합산) — 3몫 결과는 일손실 발동을 과대 반영할 수 있음",
+  "20연패 진입 중단·강제청산 진입 중단·사람 재개는 리플레이에 없음",
+  "데이터: OKX 1H last 봉 (2020-01-01~), 누락 시간 없음 확인, 보간 없음"
+ ],
+ "data": {
+  "BTC-USDT-SWAP": {
+   "source": "OKX /market/history-candles 1H (last 가격), data_cache 캐시",
+   "tz": "UTC",
+   "first": "2020-01-01 00:00:00",
+   "last": "2026-10-10 15:00:00",
+   "rows": 59392,
+   "unconfirmed_rows": 0,
+   "gaps_over_1h": 0,
+   "sha256_16": "881adb2a781ac1b2",
+   "eval": [
+    "2023-07-01",
+    "2026-10-09"
+   ],
+   "warmup": "평가 시작 전 봉은 신호 계산에만 (SMA50+기울기20+CONF3 ≥ 73일, ATR14)"
+  },
+  "ETH-USDT-SWAP": {
+   "source": "OKX /market/history-candles 1H (last 가격), data_cache 캐시",
+   "tz": "UTC",
+   "first": "2020-01-01 00:00:00",
+   "last": "2026-10-10 15:00:00",
+   "rows": 59392,
+   "unconfirmed_rows": 0,
+   "gaps_over_1h": 0,
+   "sha256_16": "c7adeddf5161ee57",
+   "eval": [
+    "2023-07-01",
+    "2026-10-09"
+   ],
+   "warmup": "평가 시작 전 봉은 신호 계산에만 (SMA50+기울기20+CONF3 ≥ 73일, ATR14)"
+  }
+ },
+ "code": {
+  "files_sha": "8950e82e655f",
+  "git": "e981f63",
+  "dirty": true
+ },
+ "experiment_note": "설정(10x→20x→30x, 4%→2%, 1몫→3몫, CONF3·BE1·DROP1)은 2020-04~2026-10 전 구간을 본 뒤 고름 (git: 4737945 10-06 10x, e981f63 10-09 20x DROP1, 작업 트리 10-11 30x 3몫). 2023-07-01 이후도 사후 검토된 구간이지 독립 검증이 아니다."
+}

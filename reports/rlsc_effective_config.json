@@ -1,0 +1,162 @@
+{
+ "generated": "2026-10-11",
+ "note": "비밀정보 없음 (키·시크릿·패스프레이즈·웹훅 URL 제외). 로컬 코드에서 만든 값이며 서버 운영값이 아니다.",
+ "precedence": "코드 기본값(rls.py 상수) < 환경변수(MODE, RLSC_TRANCHES, RLSC_RISK_POLL_SEC, RLSC_PROTECT_SEC; .env 는 python-dotenv 가 이미 있는 환경변수를 덮지 않음) < 실행 인자(--job/--resume/--preflight 는 설정을 바꾸지 않음). systemd Environment= 는 환경변수로 들어온다. 서비스 설명 문자열은 모드의 증거가 아니다.",
+ "local_default": {
+  "mode": "dry",
+  "strategy": {
+   "insts": [
+    "BTC-USDT-SWAP",
+    "ETH-USDT-SWAP"
+   ],
+   "tranches_utc": [
+    0,
+    8,
+    16
+   ],
+   "lever": 30,
+   "margin_per_symbol": 0.02,
+   "margin_per_tranche": 0.006666666666666667,
+   "max_total_margin": 0.1,
+   "signal": {
+    "ver": "RLS-C1",
+    "sma": 50,
+    "slope": 20,
+    "conf": 3,
+    "atr": "wilder14",
+    "sl_atr": 1.5,
+    "liq_buf": 0.01,
+    "be_atr": 1.0,
+    "be_off": 0.0015,
+    "drop_atr": 1.0,
+    "edge_why": [
+     "sl",
+     "liq",
+     "drop1"
+    ],
+    "bar": "4H confirmed -> 24h at tranche boundary"
+   },
+   "risk": {
+    "ver": "R2",
+    "kill_dd": 0.35,
+    "daily_loss": 0.05,
+    "daily_ref": "UTC 00:00 record",
+    "streak_hold": 20,
+    "anomaly": 0.03,
+    "stop_trigger": "last"
+   },
+   "cost": {
+    "taker": 0.0005,
+    "slip_one_way": 0.0002,
+    "funding_8h": 0.0001,
+    "funding_model": "constant, sign by side"
+   }
+  },
+  "strategy_hash": "1ccafa2906b7",
+  "code": {
+   "files_sha": "3f739eac7f4e",
+   "git": "e981f63",
+   "dirty": true
+  },
+  "source": {
+   "RLSC_TRANCHES": "default",
+   "MODE": "env"
+  },
+  "runtime": {
+   "risk_poll_sec": 60.0,
+   "protect_sec": 60.0,
+   "lever_applied": "min(lever, exchange max) — 거래소 조회값은 leverage-info"
+  }
+ },
+ "local_RLSC_TRANCHES_0": {
+  "mode": "dry",
+  "strategy": {
+   "insts": [
+    "BTC-USDT-SWAP",
+    "ETH-USDT-SWAP"
+   ],
+   "tranches_utc": [
+    0
+   ],
+   "lever": 30,
+   "margin_per_symbol": 0.02,
+   "margin_per_tranche": 0.02,
+   "max_total_margin": 0.1,
+   "signal": {
+    "ver": "RLS-C1",
+    "sma": 50,
+    "slope": 20,
+    "conf": 3,
+    "atr": "wilder14",
+    "sl_atr": 1.5,
+    "liq_buf": 0.01,
+    "be_atr": 1.0,
+    "be_off": 0.0015,
+    "drop_atr": 1.0,
+    "edge_why": [
+     "sl",
+     "liq",
+     "drop1"
+    ],
+    "bar": "4H confirmed -> 24h at tranche boundary"
+   },
+   "risk": {
+    "ver": "R2",
+    "kill_dd": 0.35,
+    "daily_loss": 0.05,
+    "daily_ref": "UTC 00:00 record",
+    "streak_hold": 20,
+    "anomaly": 0.03,
+    "stop_trigger": "last"
+   },
+   "cost": {
+    "taker": 0.0005,
+    "slip_one_way": 0.0002,
+    "funding_8h": 0.0001,
+    "funding_model": "constant, sign by side"
+   }
+  },
+  "strategy_hash": "34423b221c7e",
+  "code": {
+   "files_sha": "3f739eac7f4e",
+   "git": "e981f63",
+   "dirty": true
+  },
+  "source": {
+   "RLSC_TRANCHES": "env",
+   "MODE": "env"
+  },
+  "runtime": {
+   "risk_poll_sec": 60.0,
+   "protect_sec": 60.0,
+   "lever_applied": "min(lever, exchange max) — 거래소 조회값은 leverage-info"
+  }
+ },
+ "diff_default_vs_1tranche": [
+  "margin_per_tranche: 0.006666666666666667 → 0.02",
+  "tranches_utc: [0, 8, 16] → [0]"
+ ],
+ "server": {
+  "status": "unverified",
+  "reason": "서버 접근 없음 (이번 작업은 로컬 전용)",
+  "claimed_by_patch_doc": {
+   "RLSC_TRANCHES": "0 (1몫)",
+   "MODE": "live 로 보임 (서비스 설명 문자열 근거 — 확정 아님)",
+   "lever": "30x"
+  },
+  "if_claim_true_strategy_hash": "34423b221c7e",
+  "matching_backtest": "reports/rlsc_runs/c1-l30",
+  "verify_readonly": [
+   "systemctl show rlsc-autotrade -p Environment -p ExecStart -p Description",
+   "sudo -u <봇 사용자> sh -c 'cd ~/quant-deploy/rlsc_src && sha256sum rls.py okx.py autotrade.py'",
+   "curl -s http://127.0.0.1:8000/api/state | python3 -c 'import json,sys;s=json.load(sys.stdin);print(s[\"mode\"],s.get(\"config\",{}).get(\"strategy_hash\"),s[\"tranches\"])'",
+   "python autotrade.py --preflight  (조회만; leverage-info 로 거래소 적용 레버리지 확인)"
+  ]
+ },
+ "exchange_applied": {
+  "lever": "unverified (leverage-info 조회 필요)",
+  "posMode": "unverified",
+  "mgnMode": "unverified",
+  "tier1_mmr": "unverified (리플레이는 0.4% 가정)"
+ }
+}

@@ -1,45 +1,80 @@
-"""RLS 20x DROP1 규칙 — 순수 함수, 거래소 호출 없음. 규칙을 바꾸지 않는다.
-과거 백테스트(2020-01~2026-10)의 사후 탐색 결과이며 수익을 보장하지 않는다.
+"""RLS-C v1 규칙 — 순수 함수 + 한 계좌 일봉 리플레이. 거래소 호출 없음. 규칙을 바꾸지 않는다.
+과거 백테스트(2020-04-01~2026-10-09, 일봉 근사)의 사후 탐색 결과이며 수익을 보장하지 않는다.
 
-  레짐(일 d 종가): BULL = close_d > SMA50_d & SMA50_d > SMA50_(d-20), BEAR = 거울상, 그 외 NEUTRAL.
-  CONF3: d-2, d-1, d 레짐이 모두 같을 때만 확정 레짐_d = 레짐_d, 아니면 NEUTRAL. d+1 00:00 UTC 부터 적용.
-  진입: 확정 레짐이 새로 켜진 날(전날 확정 레짐과 다름)의 다음 1H 시가. 같은 레짐 동안 재진입 없음(edge).
-  손절: 거리 = min(1.5×ATR14/진입 직전 종가, 청산 거리 − 1%p), 청산 거리 = 1/20 − MMR − taker ≈ 4.55%.
-  BE1: 1H 종가가 포지션 방향으로 1×ATR14(진입 시 고정) 이상 → 손절을 진입가 ± 0.15% 로 (다음 봉부터, 후퇴 없음).
-  DROP1: 1H 종가 기준 롱 c_t − c_(t−24) ≤ −1×ATR14(현재), 숏 ≥ +1×ATR14 → 다음 1H 시가 청산.
-  ATR14 = 완결 일봉 TR 의 Wilder 평활(alpha=1/14). 시점 t 에서는 t 이전에 완결된 일봉만 쓴다.
-  주의: 명세 수치(CAGR 30.9%, MDD 19.0%)는 연구 엔진의 SMA14 ATR 로 나왔다. Wilder 면 CAGR ≈ 24%, MDD ≈ 21% (ATR_KIND).
+  상품: 코인 BTC/ETH-USDT-SWAP (OKX 1Dutc 확정 일봉) · 주식 OKX 주식 무기한 (신호 = 기초 주식 정규장 조정 일봉).
+  레짐(일 d 종가): BULL = close_d > SMA50_d & SMA50_d > SMA50_(d−20), BEAR = 거울상, 그 외 NEUTRAL.
+  CONF3: d−2, d−1, d 레짐이 모두 같을 때만 확정. 다음 시가(코인 UTC 00:00, 주식 다음 정규장 시가)에 적용.
+  방향: 주식 = 확정 BULL ∧ M5 후보 → 롱 (숏 없음). 코인 = 확정 BULL 롱 / BEAR 숏 / NEUTRAL 무포지션.
+  M5: 21 거래일마다 u 종가로 mom = C[u−21]/C[u−252]−1, d200 = C[u]/mean(C[u−199..u])−1 를 NDX 전체에서 백분위
+      → 평균 = 점수 → OKX 상장(이력 ≥ 260일) 상위 5. 다음 거래일 시가부터 21 거래일 유지, 빠진 종목은 그 시가에 청산.
+  사이징: L = min(30, 거래소 최대) (명세 20x 에서 사용자 결정으로 변경), 증거금 = 실현 잔고의 2%, 동시 증거금 합 ≤ 전일 자산 10% (주식 M5 순 → BTC → ETH).
+  손절: 거리 = min(1.5×ATR14/신호 봉 종가, 1/L − 티어1 MMR − taker − 1%p). 체결가 기준.
+  BE1: 종가가 포지션 방향으로 1×ATR14(진입 시 고정) → 손절 = 진입가 ± 0.15% (다음 봉부터, 후퇴 없음).
+       주식은 비율 환산: 기초 종가 − 신호 봉 기초 종가 ≥ ATR (무기한 베이시스 제외).
+  DROP1: 롱 close_t − close_(t−1) ≤ −1×ATR14_t, 숏 ≥ +1×ATR14_t → 다음 시가 청산.
+  edge: 손절·DROP1 로 정리되면 원하는 방향이 한 번 0(또는 반대)이 됐다가 다시 켜질 때만 재진입.
+  C (2026-10-12 사용자 결정, 코인): ① 본전(BE1) 뒤 손절은 edge 를 걸지 않는다 (추세가 맞았던 거래).
+       ② 신호 봉 ATR14/종가 > 8% 면 진입하지 않고 대기 (30x 손절 1.88% 가 0.25 ATR 미만 → 진입일 잡음 손절).
+       교차 검증(2020-22 · 2023-24 · 2025~, ETH/BTC/BTC+ETH)에서 모든 구간 같거나 개선. 같은 데이터로 고른 규칙이다.
+  ATR14 = 완결 일봉 TR 의 Wilder 평활 (alpha = 1/14, 최소 14봉).
 """
+import hashlib
+import json
+
 import numpy as np
 import pandas as pd
 
-SMA, SLOPE, ATR_N, CONF = 50, 20, 14, 3
-MIN_DAYS = SMA + SLOPE                 # SMA50 + 기울기 20일 = 완결 일봉 70개 이상
-MARGIN, LEVER = 0.04, 20               # 증거금 = 자산의 4%, 20x 격리 → 명목 80% (종목당)
+SMA, SLOPE, ATR_N = 50, 20, 14
+STOCK_MIN = 260                        # 주식 후보 최소 이력 (거래일)
+LEVER, MARGIN, MAX_TOTAL = 30, 0.02, 0.10   # 2026-10-11 사용자 결정: 20x → 30x (증거금 2% 유지, 손절 상한 1.88%)
 SL_ATR, LIQ_BUF, BE_ATR, BE_OFF, DROP_ATR = 1.5, 0.01, 1.0, 0.0015, 1.0
-TAKER, SLIP = 0.0005, 0.0002
-COST = TAKER + SLIP                    # 편도 (왕복 약 0.14%)
-FUNDING_8H = 0.0001                    # 백테스트 가정 0.01%/8h
-MMR = 0.004                            # ponytail: 유지증거금률 1구간 근사. 실제 티어는 데모에서 확인 (체크리스트 4)
-KILL_SIM, DAILY_LOSS = 0.40, 0.05      # 백테스트 엔진 킬 스위치 40% (운용은 35%), 일손실 −5%
-DAY_MS, H_MS = 86_400_000, 3_600_000
-ATR_KIND = "wilder"                    # 명세 문구. "sma" = 연구 엔진(명세 수치 재현)
+TAKER, SLIP, FUNDING_8H = 0.0005, 0.0002, 0.0001
+KILL_DD, DAILY_LOSS = 0.35, 0.05      # 운용·백테스트 공통 (예전 KILL_SIM 0.40 은 운용 0.35 와 달라 통일)
+STREAK_HOLD, ANOMALY = 20, 0.03        # 계좌 20연패 → 진입 중단 (리플레이엔 없음) · 거래 손실 > 자산 3% 경보
+SIGNAL_VER = "RLS-C2"                  # SMA50·기울기20·CONF3·ATR14(Wilder)·손절 cap·BE1·DROP1·edge — 바꾸면 올린다
+RISK_VER = "R2"                        # R1: 킬은 점검이 기록만, 청산은 다음 몫 작업. R2: 위험 감시(기본 5초)가 즉시 계좌 단위 청산,
+                                       #     일손실 기준 = UTC 00:00 직후 첫 감시 기록(경계에서만 판정, 리플레이와 같음), 입출금 조정
+STOP_TRIGGER = "last"                  # 손절 발동 가격 종류 (리플레이 = 일봉 last 고저)
+M5_N, M5_EVERY, MOM_SKIP, MOM_LOOK, D200 = 5, 21, 21, 252, 200
+COINS = ("BTC-USDT-SWAP", "ETH-USDT-SWAP")
+TRANCHES = (0, 8, 16)                  # 시각 분할: 몫별 일봉 경계 (UTC 시). 몫당 증거금 = MARGIN / 몫 수
+EDGE_WHY = ("sl", "liq", "drop1")      # 이 사유로 정리되면 edge 재진입 제한
+BE_EDGE = False                        # C①: 본전 뒤 손절도 edge 를 걸까 (C1 = True)
+ATR_MAX = 0.08                         # C②: 신호 봉 ATR14/종가 상한 (코인 진입). None = 없음 (C1)
+SIM_MMR = {"coin": 0.004, "stock": 0.02}   # ponytail: 리플레이용 티어1 MMR 가정. 운용은 public/position-tiers 를 매일 조회
 
 
-def daily(h1):
-    """1H 봉(ts ms, open, high, low, close, confirm) → UTC 00:00 경계 일봉.
-    24개 1H 가 모두 확정(confirm=1)된 날만 남긴다. index = 그날 00:00 UTC (naive Timestamp)."""
-    h = h1[h1.confirm == 1].sort_values("ts")
-    g = h.groupby(h.ts // DAY_MS)
-    d = pd.DataFrame({"open": g.open.first(), "high": g.high.max(), "low": g.low.min(),
-                      "close": g.close.last(), "n": g.size()})
-    d = d[d.n == 24].drop(columns="n")
-    d.index = pd.to_datetime(d.index * DAY_MS, unit="ms")
-    return d
+def strategy_config(tranches=TRANCHES, lever=LEVER, insts=COINS, margin=None):
+    """수익률 비교에 쓰는 전략 설정 (모드·인증 정보 없음). 운용·리플레이가 같은 dict 를 만든다. margin = 종목당 증거금 비율."""
+    n, margin = len(tranches), MARGIN if margin is None else margin
+    return {"insts": list(insts), "tranches_utc": list(tranches), "lever": lever,
+            "margin_per_symbol": margin, "margin_per_tranche": margin / n, "max_total_margin": MAX_TOTAL,
+            "signal": {"ver": SIGNAL_VER, "sma": SMA, "slope": SLOPE, "conf": 3, "atr": f"wilder{ATR_N}", "sl_atr": SL_ATR,
+                       "liq_buf": LIQ_BUF, "be_atr": BE_ATR, "be_off": BE_OFF, "drop_atr": DROP_ATR,
+                       "edge_why": list(EDGE_WHY), "be_edge": BE_EDGE, "atr_max": ATR_MAX, "bar": "4H confirmed -> 24h at tranche boundary"},
+            "risk": {"ver": RISK_VER, "kill_dd": KILL_DD, "daily_loss": DAILY_LOSS, "daily_ref": "UTC 00:00 record",
+                     "streak_hold": STREAK_HOLD, "anomaly": ANOMALY, "stop_trigger": STOP_TRIGGER},
+            "cost": {"taker": TAKER, "slip_one_way": SLIP, "funding_8h": FUNDING_8H, "funding_model": "constant, sign by side"}}
+
+
+def config_hash(cfg):
+    return hashlib.sha256(json.dumps(cfg, sort_keys=True).encode()).hexdigest()[:12]
+
+
+def config_diff(a, b, path=""):
+    """사람이 읽는 필드별 차이 ["lever: 20 → 30", ...]."""
+    out = []
+    for k in sorted(set(a) | set(b)):
+        x, y = a.get(k), b.get(k)
+        if isinstance(x, dict) and isinstance(y, dict):
+            out += config_diff(x, y, f"{path}{k}.")
+        elif x != y:
+            out.append(f"{path}{k}: {x} → {y}")
+    return out
 
 
 def regime(d):
-    """{1: BULL, -1: BEAR, 0: NEUTRAL}. SMA50 은 '최근 50개 완결 일봉' (결측일은 daily() 에서 이미 빠져 있다)."""
+    """{1: BULL, -1: BEAR, 0: NEUTRAL}. SMA50 = 최근 50개 완결 일봉 종가 평균."""
     c = d.close
     s = c.rolling(SMA).mean()
     sh = s.shift(SLOPE)
@@ -47,32 +82,76 @@ def regime(d):
 
 
 def confirm(reg):
-    """CONF3: 최근 3개 완결 일봉 레짐이 모두 같으면 그 레짐, 아니면 0."""
+    """CONF3: d−2, d−1, d 레짐이 모두 같으면 그 레짐, 아니면 0."""
     same = (reg == reg.shift(1)) & (reg == reg.shift(2))
     return reg.where(same, 0).astype(int)
 
 
-def edges(conf):
-    """확정 레짐이 새로 켜진 날 (전날 확정 레짐과 다르고 NEUTRAL 이 아님)."""
-    return (conf != conf.shift()) & (conf != 0)
-
-
-def atr(d, kind=None):
-    """ATR14 (완결 일봉). wilder = True Range 의 Wilder 평활 (alpha = 1/14), sma = 14일 단순평균. 첫 날 TR = high - low."""
+def atr(d):
+    """ATR14: True Range 의 Wilder 평활 (alpha = 1/14, 최소 14봉). 첫 봉 TR = high − low."""
     pc = d.close.shift()
     tr = pd.concat([d.high - d.low, (d.high - pc).abs(), (d.low - pc).abs()], axis=1).max(axis=1)
-    if (kind or ATR_KIND) == "sma":
-        return tr.rolling(ATR_N).mean()
     return tr.ewm(alpha=1 / ATR_N, adjust=False, min_periods=ATR_N).mean()
 
 
-def liq_dist(lever=LEVER):
-    return 1 / lever - MMR - TAKER
+def prep(d):
+    """일봉 → 행마다 그 봉 종가에 아는 값: reg, conf(CONF3), atr, prev(직전 봉 종가)."""
+    x = d[["open", "high", "low", "close"]].astype(float).copy()
+    x["reg"] = regime(x)
+    x["conf"] = confirm(x.reg)
+    x["atr"] = atr(x)
+    x["prev"] = x.close.shift()
+    return x
 
 
-def stop_dist(atr_v, prev_close, lever=LEVER):
-    """손절 거리(비율) = min(1.5×ATR/진입 직전 종가, 청산 거리 − 1%p). 항상 청산가보다 진입가 쪽."""
-    return min(SL_ATR * atr_v / prev_close, liq_dist(lever) - LIQ_BUF)
+def offset_daily(b, offset=0, bar_h=4):
+    """bar_h 시간 봉 [ts, open, high, low, close, confirm] → offset 시(UTC) 경계 24시간 봉. 확정 봉만, 봉이 빠진 날은 버린다.
+    index = 그 24시간의 시작 시각 (offset=0 이면 OKX 1Dutc 와 같다)."""
+    b = b[b.confirm == 1].sort_values("ts").drop_duplicates("ts")
+    t = pd.to_datetime(b.ts, unit="ms") - pd.Timedelta(hours=offset)
+    g = b.groupby(t.dt.floor("D").to_numpy())
+    d = pd.DataFrame({"open": g.open.first(), "high": g.high.max(), "low": g.low.min(), "close": g.close.last(),
+                      "n": g.size()})
+    d = d[d.n == 24 // bar_h].drop(columns="n").astype(float)
+    d.index = pd.DatetimeIndex(d.index) + pd.Timedelta(hours=offset)
+    return d
+
+
+def simulate_tranches(h1, offsets, start, end=None, kill=KILL_DD, **kw):
+    """시각 분할 리플레이: 자본을 len(offsets) 등분, 몫마다 offset 경계 일봉으로 코인 리플레이 → 날짜별 일수익 평균.
+    h1: {instId: 1H 봉}. → (일별 자산 Series, 몫별 거래 DataFrame [tranche 열]).
+    킬은 운용처럼 계좌(몫 평균) 기준: 일별 자산이 고점 대비 kill 이상 빠진 날 이후는 자산 고정·그 뒤 진입 거래 제외
+    (그날 기록 시점 값으로 전량 청산했다고 본다). 1몫이면 simulate 의 킬과 같다.
+    ponytail: 일손실은 몫마다 따로 본다 (실운용은 계좌 합산 — 몫별 일손실을 끈 비교에서 영향 작음). 리밸런싱 없음 = 몫별 독립 복리."""
+    rets, trades = [], []
+    for k, off in enumerate(offsets):
+        X = {i: offset_daily(h, off, 1) for i, h in h1.items()}
+        st = pd.Timestamp(start) + pd.Timedelta(hours=off)
+        en = None if end is None else pd.Timestamp(end) + pd.Timedelta(hours=off)
+        eq, t, _ = simulate(X, {}, lambda _: set(), set(), st, en, sleeves=("coin",), kill=kill if len(offsets) == 1 else 1.0, **kw)
+        rets.append(eq.groupby(eq.index.normalize()).last().pct_change())
+        trades.append(t.assign(tranche=k))
+    r = pd.concat(rets, axis=1).dropna().mean(axis=1)
+    eq = pd.concat([pd.Series([1.0], index=[r.index[0] - pd.Timedelta(days=1)]), (1 + r).cumprod()])
+    t = pd.concat(trades, ignore_index=True)
+    hit = eq.index[1 - eq / eq.cummax() >= kill]
+    if len(offsets) > 1 and len(hit):
+        eq = eq.where(eq.index <= hit[0], eq.loc[hit[0]])
+        t = t[t.entry_ts < hit[0]]
+    return eq, t
+
+
+def lever_for(max_lever):
+    return min(LEVER, float(max_lever))
+
+
+def liq_dist(lever, mmr):
+    return 1 / lever - mmr - TAKER
+
+
+def stop_dist(atr_v, sig_close, lever, mmr):
+    """손절 거리(비율) = min(1.5×ATR/신호 봉 종가, 청산 거리 − 1%p). 항상 청산가보다 진입가 쪽."""
+    return min(SL_ATR * atr_v / sig_close, liq_dist(lever, mmr) - LIQ_BUF)
 
 
 def stop_px(side, entry, dist):
@@ -88,8 +167,9 @@ def be_px(side, entry):
     return entry * (1 + side * BE_OFF)
 
 
-def be_hit(side, close, entry, atr_entry):
-    return side * (close - entry) >= BE_ATR * atr_entry
+def be_hit(side, close, ref, atr_e):
+    """ref = 코인은 진입가, 주식은 신호 봉 기초 종가 (비율 환산)."""
+    return side * (close - ref) >= BE_ATR * atr_e
 
 
 def tighten(side, old, new):
@@ -97,156 +177,223 @@ def tighten(side, old, new):
     return max(old, new) if side > 0 else min(old, new)
 
 
-def drop1(side, c_now, c_24, atr_v):
-    return side * (c_now - c_24) <= -DROP_ATR * atr_v
+def edge_after(why, be, be_edge=BE_EDGE):
+    """이 청산 뒤 같은 방향 재진입을 막을까 (edge). be = 본전(BE1) 손절로 올라가 있었나."""
+    return why in EDGE_WHY and (be_edge or why != "sl" or not be)
+
+
+def vol_ok(atr_v, close, atr_max=ATR_MAX):
+    """C②: 신호 봉 변동성이 손절폭에 비해 너무 크지 않을 때만 진입."""
+    return not atr_max or atr_v / close <= atr_max
+
+
+def drop1(side, c, c_prev, atr_v):
+    return side * (c - c_prev) <= -DROP_ATR * atr_v
 
 
 def funding_pnl(side, rate, notional):
-    """펀딩 손익. 양(+) 펀딩이면 롱이 지불(-), 숏이 수취(+)."""
+    """펀딩 손익. 양(+) 펀딩이면 롱이 지불(−), 숏이 수취(+)."""
     return -side * rate * notional
 
 
-def signals(h1, atr_kind=None):
-    """1H 봉 → 봉별 신호 DataFrame (index = ts). 봉 i 종가 시점에 알 수 있는 것만 쓴다:
-    want = 봉 i 종가 때 완결된 마지막 일봉의 확정 레짐 (봉 i+1 시가에 적용), atr = 같은 일봉의 ATR14,
-    c24 = 24봉 전 1H 종가. 일봉 결측이면 want=NaN (신호 갱신 없음)."""
-    h = h1[h1.confirm == 1].sort_values("ts").drop_duplicates("ts").set_index("ts")
-    d = daily(h1)
-    day = pd.to_datetime((h.index + H_MS) // DAY_MS * DAY_MS - DAY_MS, unit="ms")
-    out = h[["open", "high", "low", "close"]].copy()
-    out["reg"] = regime(d).reindex(day).to_numpy(float)
-    out["want"] = confirm(regime(d)).reindex(day).to_numpy(float)
-    out["atr"] = atr(d, atr_kind).reindex(day).to_numpy(float)
-    out["c24"] = h.close.reindex(h.index - DAY_MS).to_numpy(float)
-    return out
+def okx_sym(ticker):
+    """기초 티커 → OKX 무기한 기초명 (BRK-B / BRK.B → BRKB)."""
+    return ticker.replace("-", "").replace(".", "").upper()
 
 
-def simulate(h1, lever=LEVER, margin=MARGIN, start=None, kill=KILL_SIM, daily_loss=DAILY_LOSS,
-             funding_8h=FUNDING_8H, atr_kind=None):
-    """1H 리플레이, 한 종목 = 독립 계좌 (연구 엔진 src/backtest/engine.py 와 같은 순서). → (1H 자산 Series, 거래 DataFrame)
-    봉 i 시가: 예약 청산(drop1/daily_loss/halt) 또는 레짐 청산 → 진입(확정 레짐 ≠ 0, edge 차단 아님).
-    봉 i 장중: 손절(갭이면 시가, 불리) / 청산가(시가에 가까운 쪽 먼저). 봉 i 종가: 펀딩(00/08/16 UTC 봉) → DROP1 → BE1
-    (다음 봉부터) → 평가 → 일손실(−5% → 다음 시가 청산, 그날 진입 없음) → 킬(고점 대비 kill → 청산·영구 정지).
-    체결: 불리한 방향 슬리피지 2bps + taker 0.05%. 손실은 격리 증거금으로 상한. edge: sl/drop1/daily_loss 뒤에는
-    확정 레짐이 한 번 바뀔 때까지 같은 방향 진입 금지 (연구 엔진은 일손실 뒤엔 다음 날 바로 재진입 — 명세 문구를 따른다).
-    start 를 주면 그 전 봉은 워밍업에만 쓴다 (그 시점에 이미 켜진 레짐에는 진입하지 않고 다음 에지를 기다린다)."""
-    x = signals(h1, atr_kind)
-    ts = x.index.to_numpy(np.int64)
-    o, h, l, c, want_, av, c24 = (x[k].to_numpy(float) for k in ("open", "high", "low", "close", "want", "atr", "c24"))
-    i0 = 1 if start is None else max(1, int(np.searchsorted(ts, int(pd.Timestamp(start).timestamp() * 1000))))
-    cash = peak = eq_prev = 1.0
-    p, blk, want, halted, flat_next, day, day_eq0, day_blk = None, 0, 0, False, None, None, 1.0, False
-    if start is not None:
-        blk = int(np.nan_to_num(want_[i0 - 1]))
-    eqs, trades = [], []
+def m5(closes, members, listed, n=M5_N):
+    """closes: u 까지 완결된 조정 종가 (행 = 거래일, 마지막 행 = u, 열 = 티커).
+    NDX 구성종목 전체에서 mom·d200 을 각각 백분위 → 평균 = 점수. OKX 상장(listed: okx_sym 집합)·이력 ≥ 260 상위 n."""
+    c = closes[sorted(t for t in members if t in closes.columns)]
+    mom = (c.iloc[-1 - MOM_SKIP] / c.iloc[-1 - MOM_LOOK] - 1) if len(c) > MOM_LOOK else pd.Series(np.nan, c.columns)
+    d200 = c.iloc[-1] / c.iloc[-D200:].mean(skipna=False) - 1
+    score = ((mom.rank(pct=True) + d200.rank(pct=True)) / 2)[c.notna().sum() >= STOCK_MIN].dropna()
+    return [t for t in score.sort_values(ascending=False, kind="stable").index if okx_sym(t) in listed][:n]
 
-    def close(i, px, why):
-        nonlocal cash, p
+
+def simulate(coins, stocks, members_at, listed, start, end=None, sleeves=("stock", "coin"), mmr=None,
+             funding_8h=FUNDING_8H, slip=SLIP, kill=KILL_DD, daily_loss=DAILY_LOSS, entry_ok=None, tp_atr=None, trail_atr=None,
+             fund_adverse=False, be_edge=BE_EDGE, atr_max=ATR_MAX, edge_days=None, edge_atr=None, retry_d1=0):
+    """한 계좌 일봉 리플레이 → (일별 자산 Series [UTC 00:00 기록], 거래 DataFrame, 일별 기록 DataFrame).
+    coins: {instId: UTC 일봉}, stocks: {티커: 정규장 조정 일봉}, members_at(day) → NDX 구성종목 집합.
+    하루 D: 00:00 자산 기록·일손실(직전 기록 대비 −5% → 코인 지금, 주식 다음 시가 청산·그 시각 진입 없음)·킬
+      → 코인 시가 (갭 손절 → 예약 청산 → 진입) → 주식 시가 (같음, M5 순) → 주식 장중 손절
+      → 주식 종가 (M5 갱신 · 레짐/후보 청산 · DROP1 · BE1 판정) → 코인 장중 손절 → 펀딩 → 코인 종가 판정.
+    손절: 시가가 손절 너머면 시가(불리), 아니면 손절가. 시가가 청산가 너머면 강제청산(손실 = 증거금).
+    entry_ok(inst, 신호 봉 날짜) → False 면 그 진입만 건너뛴다 (연구용 필터, 기본 없음 = 명세 그대로).
+    fund_adverse: 펀딩 스트레스 — 롱·숏 모두 |3×funding_8h| 를 지급 (수취 없음). 기본 = 부호대로 지급/수취.
+    C 규칙: be_edge (기본 BE_EDGE), atr_max (기본 ATR_MAX, 코인 진입만). be_edge=True, atr_max=None = 예전 C1.
+    edge 보완 (연구용, 기본 없음):
+    retry_d1=n: 진입한 날 바로 손절되면 edge 를 걸지 않고 같은 방향 재시도를 연속 n 번까지 허용 (진입일 잡음 손절 대응).
+    edge_days=n: edge 를 n 일 뒤 해제. edge_atr=k: 종가가 청산가에서 포지션 방향으로 k×ATR 더 가면 해제 (추세 지속 확인).
+    tp_atr: 진입가 ± tp_atr×ATR(진입 시) 지정가 익절 (같은 봉에 손절도 닿으면 손절 먼저). trail_atr: 봉 종가마다
+    손절을 그동안의 최고가(숏은 최저가) ∓ trail_atr×ATR 로 올린다 (다음 봉부터, 후퇴 없음). 둘 다 연구용, 기본 없음.
+    ponytail: 일봉 근사 — 주식 무기한 장외·주말 가격(기초 현물로 대체), 같은 날 코인 손절과 주식 체결의 선후는 모른다."""
+    mmr = {**SIM_MMR, **(mmr or {})}
+    X = {i: prep(d) for i, d in coins.items()} if "coin" in sleeves else {}
+    S = {t: prep(d) for t, d in stocks.items()} if "stock" in sleeves else {}
+    closes = pd.DataFrame({t: d.close for t, d in stocks.items()}).sort_index()
+    sess = closes.index if S else pd.DatetimeIndex([])
+    start = pd.Timestamp(start)
+    last_day = max([x.index[-1] for x in (*X.values(), *S.values())])
+    end = min(pd.Timestamp(end), last_day) if end is not None else last_day
+    k0 = sess.searchsorted(start) - 1                 # M5: start 직전 거래일 종가에 첫 갱신, 이후 21 거래일마다
+    refresh = set(sess[k0::M5_EVERY]) if S and k0 >= 0 else set()
+    cands_next = m5(closes.loc[:sess[k0]], members_at(sess[k0]), listed) if refresh else None
+
+    cash = peak = rec_prev = 1.0
+    pos, pend, blk, last = {}, {}, {}, {}
+    blk_at, tries = {}, {}                            # edge 보완용: {상품: (걸린 날, 청산가)}, {상품: 연속 재시도 수}
+    cands, halted, no_stock = [], False, False
+    eqs, trades, days = {}, [], []
+
+    def mark():
+        return cash + sum(p["side"] * p["qty"] * (last[i] - p["entry"]) for i, p in pos.items())
+
+    def close(i, px, why, t):
+        nonlocal cash
+        p = pos.pop(i)
+        pend.pop(i, None)
         if why == "liq":
-            gross, fee, xpx = -p["margin"], 0.0, px
+            fill, gross, fee = px, -p["margin"], 0.0
         else:
-            xpx = px * (1 - p["side"] * SLIP)
-            gross, fee = p["side"] * p["qty"] * (xpx - p["entry"]), TAKER * p["qty"] * xpx
+            fill = px * (1 - p["side"] * slip)
+            gross, fee = p["side"] * p["qty"] * (fill - p["entry"]), TAKER * p["qty"] * fill
         cash += gross - fee
-        pnl = gross - fee - p["fee_in"] + p["fund"]
-        trades.append({"entry_ts": ts[p["i"]], "exit_ts": ts[i], "side": p["side"], "entry": p["entry"], "exit": xpx,
-                       "stop_dist": p["dist"], "liq": p["liq"], "be": p["be_ts"] is not None, "be_ts": p["be_ts"],
-                       "why": why, "fee": p["fee_in"] + fee, "funding": p["fund"], "pnl": pnl, "pnl_pct": pnl / p["eq0"]})
-        p = None
+        pnl = gross - fee - p["fee"] + p["fund"]
+        quick = why == "sl" and t == p["t0"] and tries.get(i, 0) < retry_d1
+        tries[i] = tries.get(i, 0) + 1 if quick else 0
+        if edge_after(why, p["be_ts"] is not None, be_edge) and not quick:
+            blk[i], blk_at[i] = p["side"], (t, fill)
+        trades.append({"sleeve": p["sleeve"], "inst": i, "side": p["side"], "entry_ts": p["t0"], "exit_ts": t,
+                       "entry": p["entry"], "exit": fill, "margin": p["margin"], "stop_dist": p["dist"], "liq": p["liq"],
+                       "be": p["be_ts"] is not None, "be_ts": p["be_ts"], "why": why, "fee": p["fee"] + fee,
+                       "funding": p["fund"], "pnl": pnl, "pnl_pct": pnl / p["eq0"]})
 
-    for i in range(i0, len(ts)):
-        if ts[i] // DAY_MS != day:
-            day, day_eq0, day_blk = ts[i] // DAY_MS, eq_prev, False
-        if not np.isnan(want_[i - 1]):                              # 일봉 결측이면 직전 신호 유지 (소급 없음)
-            want = int(want_[i - 1])
-        if blk and want != blk:
-            blk = 0
-        if p and flat_next:
-            close(i, o[i], flat_next)
-        elif p and p.get("drop"):
-            close(i, o[i], "drop1")
-        elif p and want != p["side"]:
-            close(i, o[i], "regime")
-        flat_next = None
-        if not p and want and want != blk and not halted and not day_blk and not np.isnan(av[i - 1]):
-            px = o[i] * (1 + want * SLIP)
-            dist = stop_dist(av[i - 1], c[i - 1], lever)
-            notional = cash * margin * lever
-            p = {"side": want, "entry": px, "qty": notional / px, "margin": notional / lever, "dist": dist,
-                 "stop": stop_px(want, px, dist), "liq": px * (1 - want * liq_dist(lever)), "atr_e": av[i - 1],
-                 "be_ts": None, "i": i, "eq0": cash, "fee_in": TAKER * notional, "fund": 0.0}
-            cash -= p["fee_in"]
-        if p:
-            lo, hi = (l[i], p["stop"]) if p["side"] > 0 else (p["stop"], h[i])
-            if lo <= hi:                                             # 손절이 청산가보다 항상 안쪽 → 손절 먼저
-                gap = (o[i] - p["stop"]) * p["side"] <= 0
-                px = o[i] if gap else p["stop"]
-                d = p["side"]
-                close(i, px, "liq" if (px - p["liq"]) * d <= 0 else "sl")
-                blk = d
-        if p:
-            if ts[i] // H_MS % 8 == 0:
-                f = funding_pnl(p["side"], funding_8h, p["qty"] * c[i])
-                cash += f
-                p["fund"] += f
-            if not np.isnan(c24[i]) and not np.isnan(av[i]) and drop1(p["side"], c[i], c24[i], av[i]):
-                p["drop"] = True
-                if want == p["side"]:
-                    blk = p["side"]
-            elif p["be_ts"] is None and be_hit(p["side"], c[i], p["entry"], p["atr_e"]):
-                p["stop"], p["be_ts"] = tighten(p["side"], p["stop"], be_px(p["side"], p["entry"])), ts[i]
-        eq_prev = cash + (p["side"] * p["qty"] * (c[i] - p["entry"]) if p else 0.0)
-        eqs.append(eq_prev)
-        peak = max(peak, eq_prev)
-        if not day_blk and eq_prev <= day_eq0 * (1 - daily_loss):
-            day_blk, flat_next = True, "daily_loss"
-            if p and want == p["side"]:
-                blk = p["side"]
-        if not halted and 1 - eq_prev / peak >= kill:
-            halted, flat_next = True, "halt"
-    return pd.Series(eqs, index=pd.to_datetime(ts[i0:], unit="ms")), pd.DataFrame(trades)
+    def enter(i, side, sig, o, sleeve, t, cap):
+        """sig = 신호 봉(직전 완결 봉) 행. 반환: 동시 한도로 막혔으면 1."""
+        nonlocal cash
+        margin = cash * MARGIN
+        if sum(p["margin"] for p in pos.values()) + margin > cap + 1e-12:
+            return 1
+        dist = stop_dist(sig.atr, sig.close, LEVER, mmr[sleeve])
+        fill, eq0 = o * (1 + side * slip), mark()
+        qty, fee = margin * LEVER / fill, TAKER * margin * LEVER
+        cash -= fee
+        pos[i] = {"side": side, "entry": fill, "qty": qty, "margin": margin, "dist": dist,
+                  "stop": stop_px(side, fill, dist), "liq": fill * (1 - side * liq_dist(LEVER, mmr[sleeve])),
+                  "atr_e": sig.atr, "ref": fill if sleeve == "coin" else sig.close, "be_ts": None, "t0": t,
+                  "eq0": eq0, "fee": fee, "fund": 0.0, "sleeve": sleeve, "peak": fill,
+                  "tp": fill * (1 + side * tp_atr * sig.atr / fill) if tp_atr else None}
+        last[i] = o
+        return 0
 
+    def gap(i, o, t):
+        p = pos[i]
+        if (o - p["stop"]) * p["side"] <= 0:
+            close(i, o, "liq" if (o - p["liq"]) * p["side"] <= 0 else "sl", t)
 
-def portfolio(eqs):
-    """종목별 독립 계좌 결과를 같은 자본에 합산: 일수익 합 (연구 엔진 rls_lev.portfolio 와 같음).
-    ponytail: 종목 간 복리·동시성 무시. 실운용은 한 계좌에서 일손실·킬을 합산으로 본다."""
-    j = pd.concat([e.groupby(e.index.normalize()).last().pct_change() for e in eqs], axis=1)
-    return (1 + j.dropna(how="all").fillna(0.0).sum(axis=1)).cumprod()
+    def intraday(i, b, t):
+        p = pos.get(i)
+        if p and (b.low <= p["stop"] if p["side"] > 0 else b.high >= p["stop"]):
+            close(i, p["stop"], "sl", t)
+        elif p and p["tp"] and (b.high >= p["tp"] if p["side"] > 0 else b.low <= p["tp"]):
+            close(i, max(b.open, p["tp"]) if p["side"] > 0 else min(b.open, p["tp"]), "tp", t)
+        elif p and trail_atr:
+            p["peak"] = max(p["peak"], b.high) if p["side"] > 0 else min(p["peak"], b.low)
+            p["stop"] = tighten(p["side"], p["stop"], p["peak"] - p["side"] * trail_atr * p["atr_e"])
 
+    def judge(i, side_want, x, t):
+        """종가 판정: 레짐/후보 청산 → DROP1 → BE1 (보유 중), edge 해제."""
+        p = pos.get(i)
+        if p and i not in pend:
+            if side_want != p["side"]:
+                pend[i] = "candidate" if p["sleeve"] == "stock" and x.conf == 1 else "regime"
+            elif not np.isnan(x.atr) and not np.isnan(x.prev) and drop1(p["side"], x.close, x.prev, x.atr):
+                pend[i] = "drop1"
+                blk[i], blk_at[i] = p["side"], (t, x.close)
+            elif p["be_ts"] is None and be_hit(p["side"], x.close, p["ref"], p["atr_e"]):
+                p["stop"], p["be_ts"] = tighten(p["side"], p["stop"], be_px(p["side"], p["entry"])), t
+        if blk.get(i) and (side_want != blk[i] or edge_days and (t - blk_at[i][0]).days >= edge_days
+                           or edge_atr and not np.isnan(x.atr) and blk[i] * (x.close - blk_at[i][1]) >= edge_atr * x.atr):
+            del blk[i]
 
-def simulate_rls5(d, margin=0.02, lever=5, funding_8h=FUNDING_8H, start=None):
-    """기준선: RLS-v0 5x 2% (FWD-v2 동결 설정). 일 d 레짐(확인 없음) → d+1 시가, 손절 3×ATR 고정,
-    손절 후 같은 방향은 새 에지까지 재진입 금지. → (일별 자산 Series)."""
-    r, av = regime(d).to_numpy(), atr(d).to_numpy()
-    o, h, l, c = (d[k].to_numpy(float) for k in ("open", "high", "low", "close"))
-    cash, side, qty, entry, trig, blk = 1.0, 0, 0.0, 0.0, 0.0, 0
-    eq = [1.0]
+    for D in pd.date_range(start, end, freq="D"):
+        # 00:00(실운용 00:05) 자산 기록 → 일손실 · 킬
+        eq = mark()
+        eqs[D] = eq
+        peak = max(peak, eq)
+        dl, blocked, no_coin = eq <= rec_prev * (1 - daily_loss), 0, False
+        if dl:
+            no_coin = no_stock = True
+            pend.update({i: "daily_loss" for i in pos})
+        if not halted and 1 - eq / peak >= kill:
+            halted = True
+            pend.update({i: "halt" for i in pos})
+        rec_prev, cap = eq, MAX_TOTAL * eq
 
-    def close(px):
-        nonlocal cash, side
-        cash += max(side * qty * (px - entry), -qty * entry / lever) - COST * qty * px
-        side = 0
+        # 코인 시가 (BTC → ETH)
+        for i, x in X.items():
+            if D not in x.index:
+                continue                                    # 데이터 공백: 신호 갱신 없이 보유·손절만
+            o = x.at[D, "open"]
+            if i in pos:
+                gap(i, o, D)
+            if i in pos and i in pend:
+                close(i, o, pend[i], D)
+            prv = D - pd.Timedelta(days=1)
+            if i not in pos and prv in x.index and not halted and not no_coin:
+                sig = x.loc[prv]
+                if sig.conf and sig.conf != blk.get(i) and not np.isnan(sig.atr) and vol_ok(sig.atr, sig.close, atr_max) \
+                        and (entry_ok is None or entry_ok(i, prv)):
+                    blocked += enter(i, int(sig.conf), sig, o, "coin", D, cap)
 
-    for i in range(1, len(d)):
-        want = r[i - 1] if start is None or d.index[i] >= start else 0
-        if blk and r[i - 1] != blk:
-            blk = 0
-        if side and (o[i] - trig) * side <= 0:
-            blk = side
-            close(o[i])
-        if side and want != side:
-            close(o[i])
-        if not side and want and want != blk and not np.isnan(av[i - 1]):
-            side, entry = want, o[i]
-            qty = cash * margin * lever / o[i]
-            stop, liq = entry - side * 3 * av[i - 1], entry * (1 - side * (1 / lever - MMR))
-            trig = stop if (stop - liq) * side >= 0 else liq
-            cash -= COST * qty * o[i]
-        if side and ((side == 1 and l[i] <= trig) or (side == -1 and h[i] >= trig)):
-            blk = side
-            close(trig)
-        if side:
-            cash += funding_pnl(side, 3 * funding_8h, qty * c[i])
-        eq.append(cash + (side * qty * (c[i] - entry) if side else 0.0))
-    eq = pd.Series(eq, index=d.index)
-    return eq if start is None else eq[eq.index >= start] / eq[eq.index >= start].iloc[0]
+        # 주식 시가 → 장중 손절 → 종가 판정
+        if D in sess and S:
+            k = sess.get_loc(D)
+            if cands_next is not None:
+                cands, cands_next = cands_next, None
+            for t in list(pos):
+                if pos[t]["sleeve"] == "stock" and D in S[t].index:
+                    gap(t, S[t].at[D, "open"], D)
+                    if t in pos and t in pend:
+                        close(t, S[t].at[D, "open"], pend[t], D)
+            if not halted and not no_stock and k > 0:
+                for t in cands:
+                    x = S.get(t)
+                    if x is None or t in pos or D not in x.index or sess[k - 1] not in x.index:
+                        continue
+                    sig = x.loc[sess[k - 1]]
+                    if sig.conf == 1 and blk.get(t) != 1 and not np.isnan(sig.atr) and (entry_ok is None or entry_ok(t, sess[k - 1])):
+                        blocked += enter(t, 1, sig, x.at[D, "open"], "stock", D, cap)
+            no_stock = False
+            for t in [t for t in pos if pos[t]["sleeve"] == "stock" and D in S[t].index]:
+                intraday(t, S[t].loc[D], D)
+            if D in refresh:
+                cands_next = m5(closes.loc[:D], members_at(D), listed)
+            nxt = cands_next if cands_next is not None else cands
+            for t in set(nxt) | {t for t in pos if pos[t]["sleeve"] == "stock"} | set(blk) & set(S):
+                if t in S and D in S[t].index:
+                    x = S[t].loc[D]
+                    if t in pos:
+                        last[t] = x.close
+                    judge(t, int(x.conf == 1 and t in nxt), x, D)
+
+        # 코인 장중 손절 → 펀딩(하루 3회) → 종가 판정
+        for i, x in X.items():
+            if D in x.index:
+                intraday(i, x.loc[D], D)
+                if i in pos:
+                    last[i] = x.at[D, "close"]
+        for i, p in pos.items():
+            f = (-abs(3 * funding_8h) * p["qty"] * last[i] if fund_adverse
+                 else funding_pnl(p["side"], 3 * funding_8h, p["qty"] * last[i]))
+            cash += f
+            p["fund"] += f
+        for i, x in X.items():
+            if D in x.index:
+                judge(i, int(x.at[D, "conf"]), x.loc[D], D)
+        days.append({"date": D, "equity": eq, "dd": 1 - eq / peak, "blocked": blocked, "daily_loss": dl,
+                     "halted": halted, "n_pos": len(pos), "margin_pct": sum(p["margin"] for p in pos.values()) / eq,
+                     "cands": ",".join(cands)})
+    return pd.Series(eqs), pd.DataFrame(trades), pd.DataFrame(days).set_index("date")
