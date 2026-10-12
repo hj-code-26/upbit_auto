@@ -5,6 +5,7 @@
   구현  운용 거래·보유마다 같은 몫·상품·방향·진입 시각(±1시간)의 리플레이 거래가 있고, 청산 사유가 같고, 체결가 차이 ≤ 50bp.
         리플레이에만 있는 진입은 그때 운용 잔고로 최소 수량 미달이면 '예상된 건너뜀' (불일치 아님).
   위험  거래 1건 손실 < 기준 손절 손실(리플레이 p5) × 1.5, 검증 기간 낙폭 < 리플레이 최대 낙폭.
+  자금  실현 잔고가 몫당 최소 주문에 필요한 잔고의 110% 미만이면 경보 (미달이면 신규 진입 불가 경보).
   성과  30·90일 수익률이 리플레이 같은 길이 구간의 하위 5% 밖이면 '재검토' (자동 조치 없음. 킬 −35% 는 봇이 따로 한다).
 검증 기간은 봇이 기록한 설정 해시가 바뀐 시각부터 다시 센다 (규칙을 바꾸면 처음부터).
 리플레이는 시작 150일 전부터 돌려 edge 상태를 만든다 (운용의 seed_edge 와 같은 구실). 시작 시점에 리플레이만 보유 중인
@@ -23,6 +24,7 @@ import okx
 OUT = A.ROOT / "forward.json"
 BANDS = A.ROOT / "reports" / "rlsc_runs" / "forward_bands.json"   # 배포 스크립트가 rlsc_runs 를 통째로 복사한다
 PRICE_BP, LOSS_X, WARM_DAYS, TOL = 50, 1.5, 150, pd.Timedelta(hours=1)
+CAP_WARN, SIZE_BUF = 0.10, 0.001                      # 최소 주문 여유 경보 기준 · 운용 수량 산정 가격 여유 (autotrade.SIZE_BUF)
 
 
 def ro(sql, args=()):
@@ -43,6 +45,12 @@ def since_for(h, prev, now):
 
 def ts(x):
     return pd.Timestamp(x).tz_localize(None) if pd.Timestamp(x).tzinfo else pd.Timestamp(x)
+
+
+def min_capital(cfg, meta, price):
+    """몫당 주문이 최소 수량 이상이 되는 실현 잔고 (autotrade.open_tranche 와 같은 식). meta = (ctVal, lotSz, minSz)."""
+    ct, _, mn = meta
+    return mn * ct * price * (1 + SIZE_BUF) * len(cfg["tranches_utc"]) / (cfg["margin_per_symbol"] * cfg["lever"])
 
 
 def match(live, rep, since, eq_at, cfg, price):
@@ -91,7 +99,8 @@ def main():
     e, t, cnt = B.account_replay(H, offs, start, margin=cfg["margin_per_symbol"], lever_=cfg["lever"])
     o1 = {i: pd.Series(H[i].open.to_numpy(), index=pd.to_datetime(H[i].ts, unit="ms")) for i in H}
 
-    daily = pd.Series({pd.Timestamp(d): q for d, q in ro("SELECT date, equity FROM daily WHERE equity IS NOT NULL ORDER BY date")})
+    daily = pd.Series({d: q for d, q in ro("SELECT date, equity FROM daily WHERE equity IS NOT NULL ORDER BY date")}, dtype=float)
+    daily.index = pd.to_datetime(daily.index)                # 비어 있어도 날짜 비교가 되게
     daily = daily[daily.index >= since.floor("D")]
     eq_at = lambda t_: float(daily[daily.index <= t_].iloc[-1]) if (daily.index <= t_).any() else (kv("risk", {}).get("day") or {}).get("eq")  # noqa: E731
 
@@ -124,14 +133,30 @@ def main():
         dd = float((1 - daily / daily.cummax()).max() * 100) if len(daily) else 0.0
         risk = {"dd%": round(dd, 1), "dd_limit%": band["mdd%"], "loss_limit%": round(lim, 2)}
         if dd > band["mdd%"]:
-            flags.append(f"위험: 검증 기간 낙폭 {dd:.1f}% > 리플레이 최대 낙폭 {band['mdd%']}%")
+            flags.append(f"위험: 검증 기간 낙폭이 리플레이 최대 낙폭({band['mdd%']}%) 초과")   # 문구 고정 = 같은 문제는 한 번만 경보
         for w in (30, 90):
             if len(daily) > w:
                 r = (daily.iloc[-1] / daily.iloc[-1 - w] - 1) * 100
                 p5 = band[f"ret{w}%"]["p5"]
                 perf[f"ret{w}%"] = {"live": round(r, 2), "replay_p5": p5, "replay_p50": band[f"ret{w}%"]["p50"]}
                 if r < p5:
-                    flags.append(f"성과 재검토: 최근 {w}일 {r:+.1f}% < 리플레이 하위 5% {p5:+.1f}%")
+                    flags.append(f"성과 재검토: 최근 {w}일 수익률이 리플레이 하위 5% 밖")
+    realized, cap = (kv("okx_balance") or {}).get("realized"), {}
+    for i in cfg["insts"]:
+        try:
+            m = okx.Client().instrument(i)
+            meta = (m["ctVal"], m["lotSz"], m["minSz"])
+        except Exception:  # noqa: BLE001
+            meta = B.INST_META[i]
+        px = float(H[i].close.iloc[-1])
+        need = min_capital(cfg, meta, px)
+        cap[i] = {"price": px, "need": round(need, 2), "realized": realized,
+                  "headroom%": round((realized / need - 1) * 100, 1) if realized else None,
+                  "price_max": round(px * realized / need) if realized else None}   # 이 가격을 넘으면 진입 불가
+        if realized and realized < need * (1 + CAP_WARN):
+            s_ = i.split("-")[0]
+            flags.append(f"자금: {s_} 최소 주문 미달 — 신규 진입 불가" if realized < need
+                         else f"자금: {s_} 최소 주문 여유 {CAP_WARN:.0%} 미만 — 잔고 보충 필요")
     if len(daily) > 1:
         rs = e[e.index >= daily.index[0]]
         perf["since%"] = {"live": round((daily.iloc[-1] / daily.iloc[0] - 1) * 100, 2),
@@ -139,8 +164,10 @@ def main():
     days = (now - since).total_seconds() / 86400
     res = {"ts": now.isoformat(timespec="seconds"), "hash": h, "since": since.isoformat(), "days": round(days, 1),
            "matched": ok, "live_n": len(live), "replay_n": len(rep), "mismatch": mis, "replay_open_at_start": pre,
-           "risk": risk, "perf": perf, "band": band is not None, "flags": flags,
-           "summary": f"{days:.0f}일 · 일치 {ok}/{len(live)} · 불일치 {len(flags)}" + (f" · 낙폭 {risk['dd%']}%" if risk else "")}
+           "risk": risk, "perf": perf, "capital": cap, "band": band is not None, "flags": flags,
+           "summary": f"{days:.0f}일 · 일치 {ok}/{len(live)} · 문제 {len(flags)}" + (f" · 낙폭 {risk['dd%']}%" if risk else "")
+           + "".join(f" · {i.split('-')[0]} 최소 주문 여유 {c['headroom%']:+.0f}% ({c['price_max']:,} 넘으면 진입 불가)"
+                     for i, c in cap.items() if c["headroom%"] is not None)}
     OUT.write_text(json.dumps(res, ensure_ascii=False, indent=1, default=str))
     for f in set(flags) - set(prev.get("flags", [])):
         A.alert(f"[검증] {f}")

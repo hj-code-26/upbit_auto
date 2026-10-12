@@ -589,6 +589,13 @@ def test_forward_match():
     assert mis[0]["kind"].startswith("예상된 건너뜀"), mis
 
 
+def test_forward_min_capital():
+    """최소 주문 필요 잔고: ETH 0.001 × 2,545 × (1+10bp) × 3몫 / (4% × 30) ≈ 6.37 USDT → 7.28 USDT 면 약 2,909 까지 진입 가능."""
+    import forward
+    need = forward.min_capital({"tranches_utc": [0, 8, 16], "margin_per_symbol": 0.04, "lever": 30}, (0.1, 0.01, 0.01), 2545)
+    assert abs(need - 6.369) < 0.01 and abs(2545 * 7.28 / need - 2909) < 2
+
+
 def test_one_tranche_env():
     """RLSC_TRANCHES=0 → 1몫: 몫 증거금 = 실현 잔고 2% 전부, 작업은 t0 + guard 만."""
     import importlib
