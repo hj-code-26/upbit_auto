@@ -1,0 +1,27 @@
+# /etc/systemd/system/trade-hub.service — 미장+코인 통합 조회 화면 (읽기 전용)
+# 127.0.0.1:8899 → tailscale serve https :10000 (tailnet 전용). 기존 443(미장)·8443(코인) 은 그대로.
+# 두 대시보드(127.0.0.1:8877, :8000)에 GET 만 보낸다. 임시 사용자(DynamicUser)라 /home/quant 의 봇 코드·DB·.env 를 읽을 권한이 없고,
+# localhost 밖으로는 통신할 수 없다. 봇·대시보드를 재시작하거나 멈추지 않는다 (의존 관계 없음).
+[Unit]
+Description=Trade Hub read-only dashboard (stock + coin, 127.0.0.1:8899)
+After=network-online.target
+
+[Service]
+Type=simple
+DynamicUser=yes
+Environment=PYTHONUNBUFFERED=1 PORT=8899 STOCK_URL=http://127.0.0.1:8877 COIN_URL=http://127.0.0.1:8000
+ExecStart=/usr/bin/python3 /opt/trade-hub/hub.py
+Restart=always
+RestartSec=30
+MemoryMax=256M
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+IPAddressDeny=any
+IPAddressAllow=localhost
+
+[Install]
+WantedBy=multi-user.target
