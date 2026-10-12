@@ -7,3 +7,5 @@ __pycache__/
 data_cache/
 model.pkl
 *.lock
+.claude-flow/
+.swarm/

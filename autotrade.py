@@ -14,7 +14,7 @@
         → 청산 사유가 있으면 그 자리에서 계좌 단위 비상 청산 (RUNNING → HALTING → FLATTENING → HALTED, 실패 = DEGRADED)
         RLSC_PROTECT_SEC(기본 60초)마다 guard 와 같은 대사·손절 점검.
 위험(R2): 몫당 증거금 = 실현 잔고 2% / 몫 수, 동시 합 ≤ 일 기준 자산 10%. 일 기준 대비 −5% (UTC 날 경계 판정) → 전 몫 즉시 청산,
-      그 UTC 날 진입 없음. 킬: 일별 고점 대비 −35% (상시 판정) → 즉시 전량 청산·정지. 강제청산 1건·계좌 20연패 → 진입 중단.
+      그 UTC 날 진입 없음. 킬: 일별 고점 대비 −35% (상시 판정) → 즉시 전량 청산·정지. 강제청산 1건·몫별 20연패 → 진입 중단.
       거래 손실 > 자산 3% 경보. 조회 실패·수량 불일치·미보호 몫·봇 외 주문·미확정 주문 → 신규 진입 차단 (자동 해제).
       입출금(거래 계정 이체)은 일 기준·고점을 같은 금액만큼 옮긴다 (입금 = 수익, 출금 = 손실로 보지 않음).
 MODE (명시적 설정으로만 전환): dry = 주문 없이 장부만 (기본) | demo = OKX 데모 | live = 실거래
@@ -445,10 +445,10 @@ def record_trade(inst, k, s, exit_px, why, exit_fee, ctx):
                    s.get("lever"), s.get("margin"), s["sz"] * ct * s["entry"], s.get("dist"), t.get("liq_px"),
                    int(bool(s.get("be_ts"))), s.get("be_ts"), why, fee, s.get("fund", 0.0), pnl,
                    pnl / t.get("eq0", ctx["equity"]), None))
-    a["streak"] = a.get("streak", 0) + 1 if pnl <= 0 else 0
-    if a["streak"] >= STREAK_HOLD and "연패" not in (a.get("hold") or ""):
-        add_hold(a, f"{a['streak']}연패")
-        alert(f"계좌 {a['streak']}연패 (과거 최장 18, 미래 상한 아님) → 신규 진입 중단. 확인 후 --resume")
+    n = count_streak(a, k, pnl <= 0)
+    if n >= STREAK_HOLD and "연패" not in (a.get("hold") or ""):
+        add_hold(a, f"몫{k} {n}연패")
+        alert(f"몫 {k} {n}연패 (리플레이 몫별 최장 15, 미래 상한 아님) → 신규 진입 중단. 확인 후 --resume")
     if pnl < -ANOMALY * ctx["equity"]:
         ctx["flags"].append("anomaly")
         alert(f"{tkey(inst, k)} 거래 손실 {pnl:,.4f} > 자산의 {ANOMALY:.0%}")
@@ -556,6 +556,16 @@ def submit(ex, inst, B, cid, info, ctx):
 
 def pending_for(inst):
     return {c: i for c, i in kv_get("pending", {}).items() if i["inst"] == inst}
+
+
+def count_streak(a, k, loss):
+    """몫별 연패 → 이번 몫의 연패 수. 몫마다 독립 일정이라 1몫으로 정한 20연패 기준을 그대로 쓴다
+    (계좌 전체로 세면 몫 수만큼 길어진다: 리플레이 계좌 최장 ETH 3몫 17 · BTC+ETH 3몫 26 · 6몫 36, 몫별 최장 9~15).
+    a["streak"] = 지금 몫들 중 가장 긴 연패 (표시용)."""
+    ks = a.setdefault("streaks", {})
+    ks[str(k)] = ks.get(str(k), 0) + 1 if loss else 0
+    a["streak"] = max(ks.get(str(j), 0) for j in range(N))
+    return ks[str(k)]
 
 
 def reconcile(ex, inst, B, ctx):
@@ -1066,7 +1076,7 @@ def schedule_forever():
 def resume():
     """수동 확인 뒤: 킬(정지)·진입 중단·연패 해제. 킬을 풀면 재개 시점 자산이 새 고점. 오늘의 일손실 사유는 날짜가 바뀌어야 풀린다."""
     a = kv_get("acct", {})
-    a.update(halted=False, hold=None, streak=0)
+    a.update(halted=False, hold=None, streak=0, streaks={})
     kv_set("acct", a)
 
     def f(r):

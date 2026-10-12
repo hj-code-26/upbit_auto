@@ -39,13 +39,19 @@ def coin_daily(inst, since):
 
 
 def coin_hourly(inst, since):
-    """1H 봉 캐시 (시각 분할 리플레이용). 이어 받는다."""
+    """1H 봉 캐시 (시각 분할 리플레이용). 이어 받는다. 확정 봉만 저장한다 (미확정 봉이 남으면 이어 붙일 때 그날이 빠진다)."""
     f = CACHE / f"{inst}_1H.pkl"
-    old = pd.read_pickle(f) if f.exists() else pd.DataFrame(columns=["ts", "confirm"])
-    s = int(old.ts[old.confirm == 1].max()) + 1 if len(old) else int(pd.Timestamp(since).timestamp() * 1000)
-    df = pd.concat([old[old.ts < s], okx.Client().candles(inst, s)]).drop_duplicates("ts").sort_values("ts")
+    old = confirmed(pd.read_pickle(f)) if f.exists() else pd.DataFrame(columns=["ts", "confirm"])
+    s = int(old.ts.max()) + 1 if len(old) else int(pd.Timestamp(since).timestamp() * 1000)
+    df = confirmed(pd.concat([old, okx.Client().candles(inst, s)]).drop_duplicates("ts", keep="last").sort_values("ts"))
     df.to_pickle(f)
-    return df.reset_index(drop=True)
+    return df
+
+
+def confirmed(df):
+    """확정 봉만, ts·confirm 정수형 (캐시 파일의 object 형이 섞이면 중복 제거가 어긋난다)."""
+    df = df.astype({"ts": "int64", "confirm": "int64"})
+    return df[df.confirm == 1].reset_index(drop=True)
 
 
 def stock_daily(tickers, since, end):
@@ -101,7 +107,7 @@ SPLIT = "2023-07-01"                                   # 기존 문서의 IS/OOS
 def cached_hourly(inst):
     """캐시된 1H 봉만 (네트워크 없음). 없으면 받는다."""
     f = CACHE / f"{inst}_1H.pkl"
-    return pd.read_pickle(f) if f.exists() else coin_hourly(inst, "2020-01-01")
+    return confirmed(pd.read_pickle(f)) if f.exists() else coin_hourly(inst, "2020-01-01")
 
 
 def sha(f):

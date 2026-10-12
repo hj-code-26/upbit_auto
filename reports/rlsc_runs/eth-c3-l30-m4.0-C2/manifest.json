@@ -40,6 +40,7 @@
    "daily_loss": 0.05,
    "daily_ref": "UTC 00:00 record",
    "streak_hold": 20,
+   "streak_scope": "tranche",
    "anomaly": 0.03,
    "stop_trigger": "last"
   },
@@ -50,7 +51,7 @@
    "funding_model": "constant, sign by side"
   }
  },
- "strategy_hash": "7961ee14c8b8",
+ "strategy_hash": "bfdfa6c2cf8c",
  "kw": {},
  "lever": 30,
  "tranches_utc": [
@@ -202,9 +203,9 @@
    "source": "OKX /market/history-candles 1H (last 가격), data_cache 캐시",
    "tz": "UTC",
    "first": "2020-01-01 00:00:00",
-   "last": "2026-10-11 07:00:00",
-   "rows": 59408,
-   "unconfirmed_rows": 1,
+   "last": "2026-10-11 06:00:00",
+   "rows": 59407,
+   "unconfirmed_rows": 0,
    "gaps_over_1h": 0,
    "sha256_16": "c7adeddf5161ee57",
    "eval": [
@@ -215,8 +216,8 @@
   }
  },
  "code": {
-  "files_sha": "76aae00bb19f",
-  "git": "e981f63",
+  "files_sha": "05765b070cff",
+  "git": "8de1bbd",
   "dirty": true
  },
  "experiment_note": "설정(10x→20x→30x, 4%→2%, 1몫→3몫, CONF3·BE1·DROP1)은 2020-04~2026-10 전 구간을 본 뒤 고름 (git: 4737945 10-06 10x, e981f63 10-09 20x DROP1, 작업 트리 10-11 30x 3몫). 2023-07-01 이후도 사후 검토된 구간이지 독립 검증이 아니다."

@@ -550,6 +550,16 @@ def test_c_rules_paper():
         b.close()
 
 
+def test_streak_per_tranche():
+    """연패는 몫별로 센다: 세 몫이 번갈아 19번씩 져도(계좌 57연패) 중단 기준 20 미만, 한 몫이 20번 지면 20."""
+    a = {}
+    for _ in range(19):
+        for k in range(A.N):
+            assert A.count_streak(a, k, True) < A.STREAK_HOLD
+    assert a["streak"] == 19 and A.count_streak(a, 1, False) == 0 and a["streak"] == 19
+    assert A.count_streak(a, 0, True) == A.STREAK_HOLD and a["streak"] == 20
+
+
 def test_one_tranche_env():
     """RLSC_TRANCHES=0 → 1몫: 몫 증거금 = 실현 잔고 2% 전부, 작업은 t0 + guard 만."""
     import importlib

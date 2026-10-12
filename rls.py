@@ -30,7 +30,7 @@ LEVER, MARGIN, MAX_TOTAL = 30, 0.02, 0.10   # 2026-10-11 사용자 결정: 20x �
 SL_ATR, LIQ_BUF, BE_ATR, BE_OFF, DROP_ATR = 1.5, 0.01, 1.0, 0.0015, 1.0
 TAKER, SLIP, FUNDING_8H = 0.0005, 0.0002, 0.0001
 KILL_DD, DAILY_LOSS = 0.35, 0.05      # 운용·백테스트 공통 (예전 KILL_SIM 0.40 은 운용 0.35 와 달라 통일)
-STREAK_HOLD, ANOMALY = 20, 0.03        # 계좌 20연패 → 진입 중단 (리플레이엔 없음) · 거래 손실 > 자산 3% 경보
+STREAK_HOLD, ANOMALY = 20, 0.03        # 몫별 20연패 → 진입 중단 (리플레이엔 없음, 리플레이 몫별 최장 9~15) · 거래 손실 > 자산 3% 경보
 SIGNAL_VER = "RLS-C2"                  # SMA50·기울기20·CONF3·ATR14(Wilder)·손절 cap·BE1·DROP1·edge — 바꾸면 올린다
 RISK_VER = "R2"                        # R1: 킬은 점검이 기록만, 청산은 다음 몫 작업. R2: 위험 감시(기본 5초)가 즉시 계좌 단위 청산,
                                        #     일손실 기준 = UTC 00:00 직후 첫 감시 기록(경계에서만 판정, 리플레이와 같음), 입출금 조정
@@ -53,7 +53,7 @@ def strategy_config(tranches=TRANCHES, lever=LEVER, insts=COINS, margin=None):
                        "liq_buf": LIQ_BUF, "be_atr": BE_ATR, "be_off": BE_OFF, "drop_atr": DROP_ATR,
                        "edge_why": list(EDGE_WHY), "be_edge": BE_EDGE, "atr_max": ATR_MAX, "bar": "4H confirmed -> 24h at tranche boundary"},
             "risk": {"ver": RISK_VER, "kill_dd": KILL_DD, "daily_loss": DAILY_LOSS, "daily_ref": "UTC 00:00 record",
-                     "streak_hold": STREAK_HOLD, "anomaly": ANOMALY, "stop_trigger": STOP_TRIGGER},
+                     "streak_hold": STREAK_HOLD, "streak_scope": "tranche", "anomaly": ANOMALY, "stop_trigger": STOP_TRIGGER},
             "cost": {"taker": TAKER, "slip_one_way": SLIP, "funding_8h": FUNDING_8H, "funding_model": "constant, sign by side"}}
 
 
