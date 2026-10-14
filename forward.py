@@ -15,11 +15,13 @@ import datetime as dt
 import json
 import sqlite3
 
+import numpy as np
 import pandas as pd
 
 import autotrade as A
 import backtest as B
 import okx
+import rls
 
 OUT = A.ROOT / "forward.json"
 BANDS = A.ROOT / "reports" / "rlsc_runs" / "forward_bands.json"   # 배포 스크립트가 rlsc_runs 를 통째로 복사한다
@@ -51,6 +53,45 @@ def min_capital(cfg, meta, price):
     """몫당 주문이 최소 수량 이상이 되는 실현 잔고 (autotrade.open_tranche 와 같은 식). meta = (ctVal, lotSz, minSz)."""
     ct, _, mn = meta
     return mn * ct * price * (1 + SIZE_BUF) * len(cfg["tranches_utc"]) / (cfg["margin_per_symbol"] * cfg["lever"])
+
+
+def first_entry(close, P, n):
+    """가격이 다음 봉부터 n 봉 동안 P 에 머물 때 처음 확정되는 레짐 → (방향, 진입 시각=확정 봉이 끝나는 경계) | (0, None).
+    운용과 같은 rls.regime·rls.confirm. edge·변동성 필터는 보지 않는다 (참고용)."""
+    f = pd.concat([close, pd.Series(float(P), index=[close.index[-1] + pd.Timedelta(days=j) for j in range(1, n + 1)])])
+    cf = rls.confirm(rls.regime(pd.DataFrame({"close": f}))).iloc[len(close):]
+    hit = cf[cf != 0]
+    return (int(hit.iloc[0]), hit.index[0] + pd.Timedelta(days=1)) if len(hit) else (0, None)
+
+
+def outlook(h, offs, horizon=21, levels=(-0.10, -0.05, -0.025, 0.0, 0.025, 0.05)):
+    """가격 범위와 진입 기준 — 예측이 아니다. 범위 = 최근 60일 하루 변동성(로그 수익률 표준편차)이 이어진다고 볼 때의
+    68·95% 구간. 진입 = 가격이 각 수준에 머물 때 몫별 첫 진입 시각, 롱 기준 = SMA50, 숏 기준 = horizon 안에 숏이 확정되는 최고가."""
+    d0 = rls.offset_daily(h, 0, 1)
+    last = float(h.close.iloc[-1])
+    sig = float(np.log(d0.close).diff().dropna().iloc[-60:].std())
+    fut = [d0.index[-1] + pd.Timedelta(days=j) for j in range(1, horizon + 1)]
+    sma = d0.close.rolling(rls.SMA).mean()
+    flat = pd.concat([d0.close, pd.Series(last, index=fut)]).rolling(rls.SMA).mean().loc[fut]
+    k = np.sqrt(np.arange(1, horizon + 1))
+    cone = {f"{nm}{z}": [round(last * float(np.exp(sg * z * sig * x))) for x in k] for z in (1, 2) for nm, sg in (("lo", -1), ("hi", 1))}
+    hist = d0.iloc[-90:]
+    tr = []
+    for off in offs:
+        c = rls.offset_daily(h, off, 1).close
+        lo, hi = last * 0.5, last
+        if first_entry(c, lo, horizon)[0] == -1:
+            for _ in range(30):
+                m = (lo + hi) / 2
+                lo, hi = (m, hi) if first_entry(c, m, horizon)[0] == -1 else (lo, m)
+        sc = [first_entry(c, last * (1 + lv), horizon) for lv in levels]
+        tr.append({"off": off, "long_above": round(float(c.rolling(rls.SMA).mean().iloc[-1])),
+                   "short_below": round(lo) if first_entry(c, lo, horizon)[0] == -1 else None,
+                   "scen": [{"side": sd, "at": at.isoformat(timespec="minutes") if at is not None else None} for sd, at in sc]})
+    return {"price": round(last, 2), "sigma_d%": round(sig * 100, 2), "horizon_d": horizon, "levels": list(levels),
+            "hist": {"date": [t.strftime("%m-%d") for t in hist.index], "close": [round(v) for v in hist.close],
+                     "sma": [round(v) for v in sma.loc[hist.index]]},
+            "fut": {"date": [t.strftime("%m-%d") for t in fut], "sma_flat": [round(v) for v in flat], **cone}, "tranches": tr}
 
 
 def match(live, rep, since, eq_at, cfg, price):
@@ -168,6 +209,10 @@ def main():
            "summary": f"{days:.0f}일 · 일치 {ok}/{len(live)} · 문제 {len(flags)}" + (f" · 낙폭 {risk['dd%']}%" if risk else "")
            + "".join(f" · {i.split('-')[0]} 최소 주문 여유 {c['headroom%']:+.0f}% ({c['price_max']:,} 넘으면 진입 불가)"
                      for i, c in cap.items() if c["headroom%"] is not None)}
+    try:
+        res["outlook"] = {i: outlook(H[i], offs) for i in cfg["insts"]}       # 참고용 — 실패해도 검증 결과는 남긴다
+    except Exception as e:  # noqa: BLE001
+        res["outlook_error"] = f"{type(e).__name__}: {e}"
     OUT.write_text(json.dumps(res, ensure_ascii=False, indent=1, default=str))
     for f in set(flags) - set(prev.get("flags", [])):
         A.alert(f"[검증] {f}")

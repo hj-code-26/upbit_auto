@@ -596,6 +596,18 @@ def test_forward_min_capital():
     assert abs(need - 6.369) < 0.01 and abs(2545 * 7.28 / need - 2909) < 2
 
 
+def test_forward_outlook():
+    """가격 범위·진입 기준: 꾸준한 상승 뒤 → 지금 가격 유지면 롱 확정, 롱 기준(SMA50) < 지금 가격, 범위는 위·아래로 퍼진다."""
+    import forward
+    t = pd.date_range("2025-01-01", periods=160 * 24, freq="h")
+    px = np.linspace(100, 200, len(t)) * (1 + 0.02 * np.sin(np.arange(len(t)) / 30))
+    h = pd.DataFrame({"ts": t.as_unit("ms").astype("int64"), "open": px, "high": px * 1.002, "low": px * 0.998, "close": px, "confirm": 1})
+    o = forward.outlook(h, (0, 8, 16))
+    tr = o["tranches"][0]
+    assert tr["long_above"] < o["price"] and o["fut"]["lo1"][9] < o["price"] < o["fut"]["hi1"][9] < o["fut"]["hi2"][9]
+    assert all(c["side"] in (-1, 0, 1) for c in tr["scen"]) and len(o["hist"]["close"]) == 90
+
+
 def test_one_tranche_env():
     """RLSC_TRANCHES=0 → 1몫: 몫 증거금 = 실현 잔고 2% 전부, 작업은 t0 + guard 만."""
     import importlib

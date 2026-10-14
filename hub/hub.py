@@ -92,7 +92,7 @@ def coin():
                     "실현 잔고 (USDT)": o.get("realized"), "잔액 조회 (UTC)": o.get("ts"),
                     "장부 자산": last.get("equity"), "낙폭 %": last["dd"] * 100 if isinstance(last.get("dd"), (int, float)) else None,
                     "연패": a.get("streak"), "상태": coin_state(d(s.get("risk")), a, s),
-                    "실거래 검증": d(s.get("forward")).get("summary")},
+                    "실거래 검증": d(s.get("forward")).get("summary"), "진입 기준 (예측 아님)": outlook_line(d(s.get("forward")))},
         "tables": [
             {"title": "보유 포지션 (상품#몫)", "rows": held, "cols": ["pos", "side", "sz", "entry", "stop", "be_ts"]},
             {"title": "최근 거래 (청산 완료, UTC)", "rows": pct(lst(s.get("trades"))[:50], "pnl_pct"),
@@ -100,6 +100,18 @@ def coin():
             {"title": "최근 주문 (UTC)", "rows": lst(s.get("orders"))[:50],
              "cols": ["ts", "inst", "action", "side", "sz", "avg_px", "state"]}],
         "errors": ([err] if err else []) + [f"검증: {f}" for f in lst_str(d(s.get("forward")).get("flags"))]}
+
+
+def outlook_line(fw):
+    """forward.json 의 가격 범위·진입 기준 한 줄 (첫 상품). 없으면 None."""
+    o = next(iter(d(fw.get("outlook")).values()), None)
+    try:
+        tr, u = o["tranches"], o["fut"]
+        sb = [t["short_below"] for t in tr if t.get("short_below")]
+        return (f"롱: 종가 ≥ {min(t['long_above'] for t in tr):,} 3일 · 숏: ≤ {max(sb):,} 유지" if sb else
+                f"롱: 종가 ≥ {min(t['long_above'] for t in tr):,} 3일") + f" · 10일 68% 범위 {u['lo1'][9]:,}~{u['hi1'][9]:,}"
+    except (TypeError, KeyError, IndexError, ValueError):
+        return None
 
 
 def lst_str(x):

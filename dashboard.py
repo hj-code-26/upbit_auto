@@ -68,12 +68,32 @@ h1{font-size:20px}h2{font-size:16px;margin:0 0 12px}table{border-collapse:collap
 td,th{padding:6px 8px;text-align:right;white-space:nowrap;border-bottom:1px solid var(--bg)}th{color:var(--t3);font-weight:500}td:first-child,th:first-child{text-align:left}
 .L{color:var(--red)}.S{color:var(--blue)}.f{color:#e67e22}
 </style><div class=wrap><h1>RLS-C v1 <span id=mode style="font-size:14px;color:var(--t3)"></span></h1>
-<div class=card id=now></div><div class=card><h2>자산 vs 같은 기간 기준선 (시작 대비 %)</h2><canvas id=chart height=90></canvas></div>
+<div class=card id=now></div><div class=card><h2>가격 범위와 진입 기준 <span style="font-size:13px;color:var(--t3);font-weight:400">예측 아님 · 최근 60일 변동성이 이어진다고 볼 때의 범위</span></h2><canvas id=ol height=110></canvas><div id=olt style="margin-top:12px"></div></div><div class=card><h2>자산 vs 같은 기간 기준선 (시작 대비 %)</h2><canvas id=chart height=90></canvas></div>
 <div class=card><h2>거래</h2><table id=trades></table></div><div class=card><h2>일별 기록</h2><table id=daily></table></div><div class=card><h2>주문</h2><table id=orders></table></div></div>
 <script>
 const f=(x,d=2)=>x==null?'-':Number(x).toLocaleString('ko-KR',{maximumFractionDigits:d}),P=x=>x==null?'-':(x*100).toFixed(2)+'%';
 const S={1:'<span class=L>롱/BULL</span>','-1':'<span class=S>숏/BEAR</span>',0:'-',null:'-',undefined:'-'};
-let chart;
+let chart,olc;
+const kst=t=>{if(!t)return '-';const d=new Date(Date.parse(t+'Z')+9*3600e3);return `${d.getUTCMonth()+1}/${d.getUTCDate()} ${String(d.getUTCHours()).padStart(2,'0')}:02`};
+function drawOutlook(fw){
+  const el=document.getElementById('olt'),O=fw&&fw.outlook&&Object.entries(fw.outlook)[0];
+  if(!O){el.textContent=fw&&fw.outlook_error?'계산 실패: '+fw.outlook_error:'아직 없음 (실거래 검증이 하루 3번 계산)';return}
+  const [inst,o]=O,h=o.hist,u=o.fut,n=h.date.length,pad=a=>Array(n).fill(null).concat(a),sb=o.tranches.map(t=>t.short_below).filter(v=>v);
+  const ds=[['95% 상단',pad(u.hi2),'rgba(49,130,246,.25)','+1','rgba(49,130,246,.08)'],['95% 하단',pad(u.lo2),'rgba(49,130,246,.25)',false],
+    ['68% 상단',pad(u.hi1),'rgba(49,130,246,.45)','+1','rgba(49,130,246,.2)'],['68% 하단',pad(u.lo1),'rgba(49,130,246,.45)',false]]
+    .map(([l,d,c,fl,bg])=>({label:l,data:d,borderColor:c,borderWidth:1,pointRadius:0,fill:fl,backgroundColor:bg}));
+  ds.push({label:inst.split('-')[0]+' 종가',data:h.close,borderColor:'#3182f6',borderWidth:2,pointRadius:0},
+    {label:'SMA50 = 롱 기준 (오른쪽은 가격 유지 가정)',data:h.sma.concat(u.sma_flat),borderColor:'#8b95a1',borderWidth:2,borderDash:[6,4],pointRadius:0},
+    {label:'숏 기준 (이 아래 유지)',data:pad(u.date.map(()=>sb.length?Math.max(...sb):null)),borderColor:'#e67e22',borderWidth:2,borderDash:[2,3],pointRadius:0});
+  const data={labels:h.date.concat(u.date),datasets:ds},opt={animation:false,spanGaps:true,interaction:{mode:'index',intersect:false},
+    plugins:{legend:{labels:{filter:i=>!/하단|상단/.test(i.text)||/68% 상단|95% 상단/.test(i.text)}},tooltip:{filter:i=>i.raw!=null}}};
+  if(olc){olc.data=data;olc.update()}else olc=new Chart(document.getElementById('ol'),{type:'line',data,options:opt});
+  const lv=o.levels.map(x=>x?(x>0?'+':'')+(x*100).toFixed(1)+'%':'현재'),px=o.levels.map(x=>f(o.price*(1+x),0));
+  el.innerHTML=`<p style="font-size:13px;color:var(--t3);margin:0 0 8px">${inst.split('-')[0]} ${f(o.price)} · 하루 변동성 ${o['sigma_d%']}% · 10일 뒤 68% 범위 ${f(u.lo1[9],0)} ~ ${f(u.hi1[9],0)} · 아래 표 = 가격이 그 수준에 머물 때 몫별 첫 진입 (KST, 재진입 제한·변동성 필터 제외, ${o.horizon_d}일 안)</p>`+
+    '<table><tr><th>몫 (판단 KST)</th><th>롱: 종가 ≥ (3일)</th><th>숏: 종가 ≤ 유지</th>'+lv.map((l,j)=>`<th>${l}<br>${px[j]}</th>`).join('')+'</tr>'+
+    o.tranches.map((t,k)=>`<tr><td>#${k} (${String((t.off+9)%24).padStart(2,'0')}:02)</td><td>${f(t.long_above,0)}</td><td>${f(t.short_below,0)}</td>`+
+      t.scen.map(c=>`<td>${c.side?`<span class=${c.side>0?'L':'S'}>${c.side>0?'롱':'숏'}</span> ${kst(c.at)}`:'-'}</td>`).join('')+'</tr>').join('')+'</table>';
+}
 async function load(){
   const s=await (await fetch('/api/state')).json(),a=s.acct;
   const R=s.risk,c=s.config,bt=s.backtest,st=c.strategy;
@@ -97,6 +117,7 @@ async function load(){
   const K=[['equity','계좌',r=>(r.equity/e0-1)*100],['stock_only','주식만',r=>r.stock_only*100],['coin_only','코인만',r=>r.coin_only*100],['btc_hold','BTC 1x',r=>r.btc_hold*100]];
   const data={labels:d.map(r=>r.date),datasets:K.map(([k,n,g],j)=>({label:n,data:d.map(r=>r[k]==null?null:g(r)),borderColor:C[j],pointRadius:0,borderWidth:2}))};
   if(chart){chart.data=data;chart.update()}else chart=new Chart(document.getElementById('chart'),{type:'line',data,options:{animation:false,spanGaps:true}});
+  drawOutlook(s.forward);
 }
 load();setInterval(load,60000);
 </script></html>"""
