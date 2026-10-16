@@ -103,6 +103,21 @@ def test_risk_sizing():
     assert abs(t.pnl.iloc[0] + 0.01) < 0.001, t.pnl.iloc[0]
 
 
+def test_adx_fill():
+    """C3: SMA 레짐이 NEUTRAL(종가 < SMA50, 기울기는 아직 +)인 급락 구간 → ADX>30 DI− 3일 연속이면 conf = −1. ADX_FILL=None 이면 끈다."""
+    c = np.r_[100 * 1.01 ** np.arange(150), 100 * 1.01 ** 149 * 0.975 ** np.arange(1, 16)]
+    d = pd.DataFrame({"open": np.r_[c[0], c[:-1]], "close": c}, index=pd.date_range(T0, periods=len(c), freq="D"))
+    d["high"], d["low"] = d[["open", "close"]].max(axis=1) * 1.002, d[["open", "close"]].min(axis=1) * 0.998
+    x = rls.prep(d)
+    assert x.conf0.iloc[-1] == 0 and x.conf.iloc[-1] == -1 and (x.conf[x.conf0 != 0] == x.conf0[x.conf0 != 0]).all()
+    old = rls.ADX_FILL
+    rls.ADX_FILL = None
+    try:
+        assert (rls.prep(d).conf == x.conf0).all()
+    finally:
+        rls.ADX_FILL = old
+
+
 def test_edge_reentry():
     # 진입(봉 2) → 봉 3 손절 → BULL 유지 동안 재진입 없음 → 봉 5 NEUTRAL → 봉 6 BULL → 봉 7 재진입
     eq, t, _ = sim({BTC: frame(10, [1, 1, 1, 1, 1, 0, 1, 1, 0, 0], bars={3: (100, 100, 96, 99)})})

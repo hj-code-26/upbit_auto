@@ -16,6 +16,7 @@
   C (2026-10-12 사용자 결정, 코인): ① 본전(BE1) 뒤 손절은 edge 를 걸지 않는다 (추세가 맞았던 거래).
        ② 신호 봉 ATR14/종가 > 8% 면 진입하지 않고 대기 (30x 손절 1.88% 가 0.25 ATR 미만 → 진입일 잡음 손절).
        교차 검증(2020-22 · 2023-24 · 2025~, ETH/BTC/BTC+ETH)에서 모든 구간 같거나 개선. 같은 데이터로 고른 규칙이다.
+  C3 (2026-10-16 사용자 결정, 코인): 확정 레짐이 NEUTRAL 이면 ADX14 > 30 인 DI 방향이 3일 연속일 때 그 방향을 레짐으로 (rls.adx_dir).
   ATR14 = 완결 일봉 TR 의 Wilder 평활 (alpha = 1/14, 최소 14봉).
 """
 import hashlib
@@ -31,7 +32,7 @@ SL_ATR, LIQ_BUF, BE_ATR, BE_OFF, DROP_ATR = 1.5, 0.01, 1.0, 0.0015, 1.0
 TAKER, SLIP, FUNDING_8H = 0.0005, 0.0002, 0.0001
 KILL_DD, DAILY_LOSS = 0.35, 0.05      # 운용·백테스트 공통 (예전 KILL_SIM 0.40 은 운용 0.35 와 달라 통일)
 STREAK_HOLD, ANOMALY = 20, 0.03        # 몫별 20연패 → 진입 중단 (리플레이엔 없음, 리플레이 몫별 최장 9~15) · 거래 손실 > 자산 3% 경보
-SIGNAL_VER = "RLS-C2"                  # SMA50·기울기20·CONF3·ATR14(Wilder)·손절 cap·BE1·DROP1·edge — 바꾸면 올린다
+SIGNAL_VER = "RLS-C3"                  # SMA50·기울기20·CONF3·ATR14(Wilder)·손절 cap·BE1·DROP1·edge·ADX 보강 — 바꾸면 올린다
 RISK_VER = "R2"                        # R1: 킬은 점검이 기록만, 청산은 다음 몫 작업. R2: 위험 감시(기본 5초)가 즉시 계좌 단위 청산,
                                        #     일손실 기준 = UTC 00:00 직후 첫 감시 기록(경계에서만 판정, 리플레이와 같음), 입출금 조정
 STOP_TRIGGER = "last"                  # 손절 발동 가격 종류 (리플레이 = 일봉 last 고저)
@@ -41,6 +42,8 @@ TRANCHES = (0, 4, 8, 12, 16, 20)       # 시각 분할: 몫별 일봉 경계 (UT
 EDGE_WHY = ("sl", "liq", "drop1")      # 이 사유로 정리되면 edge 재진입 제한
 BE_EDGE = False                        # C①: 본전 뒤 손절도 edge 를 걸까 (C1 = True)
 ATR_MAX = 0.08                         # C②: 신호 봉 ATR14/종가 상한 (코인 진입). None = 없음 (C1)
+ADX_FILL, ADX_CONF = 30, 3             # C3 (2026-10-16 사용자 결정): 확정 레짐이 NEUTRAL 일 때 ADX14 > 30 인 DI 방향이 3일 연속이면 그 방향을
+                                       # 레짐으로 쓴다 (코인만). ADX_FILL = None 이면 끈다 (C2). 연구: reports/research_2026-10-16/README.md
 SIM_MMR = {"coin": 0.004, "stock": 0.02}   # ponytail: 리플레이용 티어1 MMR 가정. 운용은 public/position-tiers 를 매일 조회
 
 
@@ -51,7 +54,8 @@ def strategy_config(tranches=TRANCHES, lever=LEVER, insts=COINS, margin=None):
             "margin_per_symbol": margin, "margin_per_tranche": margin / n, "max_total_margin": MAX_TOTAL,
             "signal": {"ver": SIGNAL_VER, "sma": SMA, "slope": SLOPE, "conf": 3, "atr": f"wilder{ATR_N}", "sl_atr": SL_ATR,
                        "liq_buf": LIQ_BUF, "be_atr": BE_ATR, "be_off": BE_OFF, "drop_atr": DROP_ATR,
-                       "edge_why": list(EDGE_WHY), "be_edge": BE_EDGE, "atr_max": ATR_MAX, "bar": "4H confirmed -> 24h at tranche boundary"},
+                       "edge_why": list(EDGE_WHY), "be_edge": BE_EDGE, "atr_max": ATR_MAX,
+                       "adx_fill": ADX_FILL, "adx_conf": ADX_CONF, "bar": "4H confirmed -> 24h at tranche boundary"},
             "risk": {"ver": RISK_VER, "kill_dd": KILL_DD, "daily_loss": DAILY_LOSS, "daily_ref": "UTC 00:00 record",
                      "streak_hold": STREAK_HOLD, "streak_scope": "tranche", "anomaly": ANOMALY, "stop_trigger": STOP_TRIGGER},
             "cost": {"taker": TAKER, "slip_one_way": SLIP, "funding_8h": FUNDING_8H, "funding_model": "constant, sign by side"}}
@@ -94,11 +98,26 @@ def atr(d):
     return tr.ewm(alpha=1 / ATR_N, adjust=False, min_periods=ATR_N).mean()
 
 
+def adx_dir(d):
+    """ADX14 > ADX_FILL 이면 DI 방향(+DI > −DI → 1, 반대 → −1), 아니면 0. Wilder 평활 (alpha = 1/14)."""
+    up, dn = d.high.diff(), -d.low.diff()
+    pdm, ndm = up.where((up > dn) & (up > 0), 0.0), dn.where((dn > up) & (dn > 0), 0.0)
+    pc = d.close.shift()
+    tr = pd.concat([d.high - d.low, (d.high - pc).abs(), (d.low - pc).abs()], axis=1).max(axis=1)
+    w = lambda s: s.ewm(alpha=1 / ATR_N, adjust=False, min_periods=ATR_N).mean()  # noqa: E731
+    pdi, ndi = w(pdm) / w(tr), w(ndm) / w(tr)
+    adx = w(100 * (pdi - ndi).abs() / (pdi + ndi))
+    return np.sign(pdi - ndi).where(adx > ADX_FILL, 0).fillna(0).astype(int)
+
+
 def prep(d):
-    """일봉 → 행마다 그 봉 종가에 아는 값: reg, conf(CONF3), atr, prev(직전 봉 종가)."""
+    """일봉 → 행마다 그 봉 종가에 아는 값: reg, conf0(CONF3), conf(conf0, NEUTRAL 이면 ADX 보강), atr, prev(직전 봉 종가)."""
     x = d[["open", "high", "low", "close"]].astype(float).copy()
     x["reg"] = regime(x)
-    x["conf"] = confirm(x.reg)
+    x["conf0"] = confirm(x.reg)
+    a = adx_dir(x) if ADX_FILL else pd.Series(0, x.index)
+    same = pd.concat([a == a.shift(j) for j in range(ADX_CONF)], axis=1).all(axis=1)
+    x["conf"] = x.conf0.where(x.conf0 != 0, a.where(same, 0)).astype(int)
     x["atr"] = atr(x)
     x["prev"] = x.close.shift()
     return x
@@ -234,7 +253,7 @@ def simulate(coins, stocks, members_at, listed, start, end=None, sleeves=("stock
     ponytail: 일봉 근사 — 주식 무기한 장외·주말 가격(기초 현물로 대체), 같은 날 코인 손절과 주식 체결의 선후는 모른다."""
     mmr = {**SIM_MMR, **(mmr or {})}
     X = {i: prep(d) for i, d in coins.items()} if "coin" in sleeves else {}
-    S = {t: prep(d) for t, d in stocks.items()} if "stock" in sleeves else {}
+    S = {t: (x := prep(d)).assign(conf=x.get("conf0", x.conf)) for t, d in stocks.items()} if "stock" in sleeves else {}   # 주식은 ADX 보강 없음
     closes = pd.DataFrame({t: d.close for t, d in stocks.items()}).sort_index()
     sess = closes.index if S else pd.DatetimeIndex([])
     start = pd.Timestamp(start)
