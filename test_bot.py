@@ -96,6 +96,13 @@ def test_drop1_sign_and_gap_fill():
     assert t.why.iloc[0] == "liq" and abs(t.pnl.iloc[0] + t.margin.iloc[0] + t.fee.iloc[0]) < 1e-9, "격리: 손실 = 증거금"
 
 
+def test_risk_sizing():
+    # risk=1%: ATR 2 → 손절 3% → 명목 = 잔고 1%/3%, 손절 체결 시 손실 ≈ 잔고 1% (+ 수수료)
+    eq, t, _ = sim({BTC: frame(5, 1, bars={2: (100, 100, 96, 99)})}, risk=0.01)
+    assert t.why.iloc[0] == "sl" and abs(t.margin.iloc[0] - 0.01 / 0.03 / 20) < 1e-12
+    assert abs(t.pnl.iloc[0] + 0.01) < 0.001, t.pnl.iloc[0]
+
+
 def test_edge_reentry():
     # 진입(봉 2) → 봉 3 손절 → BULL 유지 동안 재진입 없음 → 봉 5 NEUTRAL → 봉 6 BULL → 봉 7 재진입
     eq, t, _ = sim({BTC: frame(10, [1, 1, 1, 1, 1, 0, 1, 1, 0, 0], bars={3: (100, 100, 96, 99)})})

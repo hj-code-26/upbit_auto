@@ -213,7 +213,8 @@ def m5(closes, members, listed, n=M5_N):
 
 def simulate(coins, stocks, members_at, listed, start, end=None, sleeves=("stock", "coin"), mmr=None,
              funding_8h=FUNDING_8H, slip=SLIP, kill=KILL_DD, daily_loss=DAILY_LOSS, entry_ok=None, tp_atr=None, trail_atr=None,
-             fund_adverse=False, be_edge=BE_EDGE, atr_max=ATR_MAX, edge_days=None, edge_atr=None, retry_d1=0):
+             fund_adverse=False, be_edge=BE_EDGE, atr_max=ATR_MAX, edge_days=None, edge_atr=None, retry_d1=0, risk=None,
+             max_total=MAX_TOTAL):
     """한 계좌 일봉 리플레이 → (일별 자산 Series [UTC 00:00 기록], 거래 DataFrame, 일별 기록 DataFrame).
     coins: {instId: UTC 일봉}, stocks: {티커: 정규장 조정 일봉}, members_at(day) → NDX 구성종목 집합.
     하루 D: 00:00 자산 기록·일손실(직전 기록 대비 −5% → 코인 지금, 주식 다음 시가 청산·그 시각 진입 없음)·킬
@@ -228,6 +229,8 @@ def simulate(coins, stocks, members_at, listed, start, end=None, sleeves=("stock
     edge_days=n: edge 를 n 일 뒤 해제. edge_atr=k: 종가가 청산가에서 포지션 방향으로 k×ATR 더 가면 해제 (추세 지속 확인).
     tp_atr: 진입가 ± tp_atr×ATR(진입 시) 지정가 익절 (같은 봉에 손절도 닿으면 손절 먼저). trail_atr: 봉 종가마다
     손절을 그동안의 최고가(숏은 최저가) ∓ trail_atr×ATR 로 올린다 (다음 봉부터, 후퇴 없음). 둘 다 연구용, 기본 없음.
+    risk=r: 위험 기준 사이징 — 명목 = 실현 잔고 × r / 손절 거리 (손절에 닿으면 잔고 r 손실), 증거금 = 명목 / L. 기본 = 증거금 MARGIN 고정.
+    max_total: 동시 증거금 합 상한 (전일 자산 비율).
     ponytail: 일봉 근사 — 주식 무기한 장외·주말 가격(기초 현물로 대체), 같은 날 코인 손절과 주식 체결의 선후는 모른다."""
     mmr = {**SIM_MMR, **(mmr or {})}
     X = {i: prep(d) for i, d in coins.items()} if "coin" in sleeves else {}
@@ -273,10 +276,10 @@ def simulate(coins, stocks, members_at, listed, start, end=None, sleeves=("stock
     def enter(i, side, sig, o, sleeve, t, cap):
         """sig = 신호 봉(직전 완결 봉) 행. 반환: 동시 한도로 막혔으면 1."""
         nonlocal cash
-        margin = cash * MARGIN
+        dist = stop_dist(sig.atr, sig.close, LEVER, mmr[sleeve])
+        margin = cash * risk / dist / LEVER if risk else cash * MARGIN
         if sum(p["margin"] for p in pos.values()) + margin > cap + 1e-12:
             return 1
-        dist = stop_dist(sig.atr, sig.close, LEVER, mmr[sleeve])
         fill, eq0 = o * (1 + side * slip), mark()
         qty, fee = margin * LEVER / fill, TAKER * margin * LEVER
         cash -= fee
@@ -330,7 +333,7 @@ def simulate(coins, stocks, members_at, listed, start, end=None, sleeves=("stock
         if not halted and 1 - eq / peak >= kill:
             halted = True
             pend.update({i: "halt" for i in pos})
-        rec_prev, cap = eq, MAX_TOTAL * eq
+        rec_prev, cap = eq, max_total * eq
 
         # 코인 시가 (BTC → ETH)
         for i, x in X.items():
