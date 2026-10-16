@@ -7,7 +7,7 @@
   방향: 주식 = 확정 BULL ∧ M5 후보 → 롱 (숏 없음). 코인 = 확정 BULL 롱 / BEAR 숏 / NEUTRAL 무포지션.
   M5: 21 거래일마다 u 종가로 mom = C[u−21]/C[u−252]−1, d200 = C[u]/mean(C[u−199..u])−1 를 NDX 전체에서 백분위
       → 평균 = 점수 → OKX 상장(이력 ≥ 260일) 상위 5. 다음 거래일 시가부터 21 거래일 유지, 빠진 종목은 그 시가에 청산.
-  사이징: L = min(30, 거래소 최대) (명세 20x 에서 사용자 결정으로 변경), 증거금 = 실현 잔고의 2%, 동시 증거금 합 ≤ 전일 자산 10% (주식 M5 순 → BTC → ETH).
+  사이징: L = min(30, 거래소 최대) (명세 20x 에서 사용자 결정으로 변경), 증거금 = 실현 잔고의 4% (명세 2%, 2026-10-16 사용자 결정), 동시 증거금 합 ≤ 전일 자산 10% (주식 M5 순 → BTC → ETH).
   손절: 거리 = min(1.5×ATR14/신호 봉 종가, 1/L − 티어1 MMR − taker − 1%p). 체결가 기준.
   BE1: 종가가 포지션 방향으로 1×ATR14(진입 시 고정) → 손절 = 진입가 ± 0.15% (다음 봉부터, 후퇴 없음).
        주식은 비율 환산: 기초 종가 − 신호 봉 기초 종가 ≥ ATR (무기한 베이시스 제외).
@@ -26,7 +26,7 @@ import pandas as pd
 
 SMA, SLOPE, ATR_N = 50, 20, 14
 STOCK_MIN = 260                        # 주식 후보 최소 이력 (거래일)
-LEVER, MARGIN, MAX_TOTAL = 30, 0.02, 0.10   # 2026-10-11 사용자 결정: 20x → 30x (증거금 2% 유지, 손절 상한 1.88%)
+LEVER, MARGIN, MAX_TOTAL = 30, 0.04, 0.10   # 2026-10-11 사용자 결정: 20x → 30x (손절 상한 1.88%). 2026-10-16: 증거금 2% → 4% (6몫)
 SL_ATR, LIQ_BUF, BE_ATR, BE_OFF, DROP_ATR = 1.5, 0.01, 1.0, 0.0015, 1.0
 TAKER, SLIP, FUNDING_8H = 0.0005, 0.0002, 0.0001
 KILL_DD, DAILY_LOSS = 0.35, 0.05      # 운용·백테스트 공통 (예전 KILL_SIM 0.40 은 운용 0.35 와 달라 통일)
@@ -37,7 +37,7 @@ RISK_VER = "R2"                        # R1: 킬은 점검이 기록만, 청산�
 STOP_TRIGGER = "last"                  # 손절 발동 가격 종류 (리플레이 = 일봉 last 고저)
 M5_N, M5_EVERY, MOM_SKIP, MOM_LOOK, D200 = 5, 21, 21, 252, 200
 COINS = ("BTC-USDT-SWAP", "ETH-USDT-SWAP")
-TRANCHES = (0, 8, 16)                  # 시각 분할: 몫별 일봉 경계 (UTC 시). 몫당 증거금 = MARGIN / 몫 수
+TRANCHES = (0, 4, 8, 12, 16, 20)       # 시각 분할: 몫별 일봉 경계 (UTC 시). 몫당 증거금 = MARGIN / 몫 수. 2026-10-16 사용자 결정: 3몫 → 6몫
 EDGE_WHY = ("sl", "liq", "drop1")      # 이 사유로 정리되면 edge 재진입 제한
 BE_EDGE = False                        # C①: 본전 뒤 손절도 edge 를 걸까 (C1 = True)
 ATR_MAX = 0.08                         # C②: 신호 봉 ATR14/종가 상한 (코인 진입). None = 없음 (C1)
@@ -313,8 +313,7 @@ def simulate(coins, stocks, members_at, listed, start, end=None, sleeves=("stock
             if side_want != p["side"]:
                 pend[i] = "candidate" if p["sleeve"] == "stock" and x.conf == 1 else "regime"
             elif not np.isnan(x.atr) and not np.isnan(x.prev) and drop1(p["side"], x.close, x.prev, x.atr):
-                pend[i] = "drop1"
-                blk[i], blk_at[i] = p["side"], (t, x.close)
+                pend[i] = "drop1"                            # edge 는 실제 청산 사유로 close() 가 건다 (일손실이 먼저 정리하면 없음 = 운용과 같음)
             elif p["be_ts"] is None and be_hit(p["side"], x.close, p["ref"], p["atr_e"]):
                 p["stop"], p["be_ts"] = tighten(p["side"], p["stop"], be_px(p["side"], p["entry"])), t
         if blk.get(i) and (side_want != blk[i] or edge_days and (t - blk_at[i][0]).days >= edge_days

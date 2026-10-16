@@ -226,7 +226,7 @@ def lever(L, margin=None):
         rls.LEVER, rls.MARGIN = old
 
 
-def coin_run(name, H, offs, L, start, end, cost=None, extra=None, margin=None, **kw):
+def coin_run(name, H, offs, L, start, end, cost=None, extra=None, margin=0.02, **kw):
     """한 구성 리플레이 → reports/rlsc_runs/<name>/ 에 manifest·equity·trades·rolling 저장 → 요약 dict."""
     with lever(L, margin):
         eq, tr = rls.simulate_tranches(H, offs, start, end, **kw)
@@ -289,7 +289,7 @@ def code_ver():
 def coin_validation(start=START, end=END):
     H = {i: cached_hourly(i) for i in rls.COINS}
     H = {i: h[pd.to_datetime(h.ts, unit="ms") < pd.Timestamp(end) + pd.Timedelta(days=1, hours=16)] for i, h in H.items()}
-    one, three = (0,), rls.TRANCHES
+    one, three = (0,), (0, 8, 16)                    # 기존 검증 런 = 명세 2%·3몫 (coin_run 기본 margin)
     jobs = [("c1-l30", one, 30, {}, None), ("c3-l30", three, 30, {}, None), ("c1-l20", one, 20, {}, None),
             ("c3-l20", three, 20, {}, None), ("c1-l10", one, 10, {}, None), ("c3-l10", three, 10, {}, None)]
     for base, offs in (("c1-l30", one), ("c3-l30", three)):

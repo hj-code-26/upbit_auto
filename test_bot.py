@@ -44,15 +44,15 @@ def frame(days, conf, atr_v=2.0, px=100.0, bars=None, index=None):
 def sim(coins=None, stocks_=None, cands=None, **kw):
     """rls.prep 을 항등으로, rls.m5 를 cands(날짜 → 목록) 로 대체해 리플레이."""
     coins, stocks_ = coins or {}, stocks_ or {}
-    old = rls.prep, rls.m5, rls.LEVER
-    rls.prep, rls.LEVER = (lambda d: d), 20                 # 규칙 테스트의 수치(손절 3% 등)는 명세 20x 기준
+    old = rls.prep, rls.m5, rls.LEVER, rls.MARGIN
+    rls.prep, rls.LEVER, rls.MARGIN = (lambda d: d), 20, 0.02   # 규칙 테스트의 수치(손절 3%, 동시 한도 5종목 등)는 명세 20x·2% 기준
     rls.m5 = lambda closes, members, listed, n=5: (cands or (lambda d: list(stocks_)))(closes.index[-1])
     try:
         allx = [*coins.values(), *stocks_.values()]
         return rls.simulate(coins, stocks_, lambda d: set(stocks_), set(stocks_), min(x.index[0] for x in allx)
                             + pd.Timedelta(days=1), funding_8h=0, slip=0, **kw)
     finally:
-        rls.prep, rls.m5, rls.LEVER = old
+        rls.prep, rls.m5, rls.LEVER, rls.MARGIN = old
 
 
 def test_conf3_regime_d_to_d1():
@@ -442,11 +442,11 @@ class Bot:
 def test_tranche_jobs_paper():
     b = Bot()
     try:
-        # 몫 0: 확정 BULL → 00:02 진입. 몫당 명목 = 실현 잔고 2%/3 × 30
+        # 몫 0: 확정 BULL → 00:02 진입. 몫당 명목 = 실현 잔고 4%/6 (= 예전 2%/3) × 30
         b.sig(0, 100, 1)
         b.run("t0", 100)
         p = b.pos()[1]
-        assert 0 <= 10_000 * 0.02 / 3 * 30 - p["sz"] * 0.01 * 100 < 3.5 and b.book(0)["side"] == 1   # 수량 여유 10bp·lot 내림
+        assert 0 <= 10_000 * A.MARGIN / A.N * 30 - p["sz"] * 0.01 * 100 < 3.5 and b.book(0)["side"] == 1   # 수량 여유 10bp·lot 내림
         assert b.px.leverage_info(BTC)[1] == 30.0
         st = [x for x in b.px.stops(BTC) if x["cid"] == b.book(0)["stop_cid"]]
         assert len(st) == 1 and st[0]["sz"] == b.book(0)["sz"] and st[0]["pos_side"] == 1
@@ -523,8 +523,9 @@ def test_tranche_jobs_paper():
         A.risk_update(lambda r: r.update(hwm=20_000))
         b.run("guard", 104, 11)
         assert "kill" in A.risk_get()["flatten"] and A.risk_get()["state"] == "HALTED" and any("킬 스위치" in m for m in b.alerts)
-        # 스케줄: 몫 작업 HH:02 (00·08·16) + 매시 07분 점검
-        assert A.next_job(pd.Timestamp("2026-10-12 07:59", tz="UTC"))[1] == "t1"
+        # 스케줄: 몫 작업 HH:02 (00·04·08·12·16·20) + 매시 07분 점검
+        assert A.next_job(pd.Timestamp("2026-10-12 03:59", tz="UTC"))[1] == "t1"
+        assert A.next_job(pd.Timestamp("2026-10-12 07:59", tz="UTC"))[1] == "t2"
         assert A.next_job(pd.Timestamp("2026-10-12 08:03", tz="UTC"))[1] == "guard"
         assert A.next_job(pd.Timestamp("2026-10-12 23:58", tz="UTC"))[1] == "t0"
     finally:
@@ -616,14 +617,14 @@ def test_forward_outlook():
 
 
 def test_one_tranche_env():
-    """RLSC_TRANCHES=0 → 1몫: 몫 증거금 = 실현 잔고 2% 전부, 작업은 t0 + guard 만."""
+    """RLSC_TRANCHES=0 → 1몫: 몫 증거금 = 종목당 비율 전부, 작업은 t0 + guard 만."""
     import importlib
     import subprocess
     out = subprocess.run([sys.executable, "-c", "import autotrade as A; print(A.N, A.TRANCHES, A.next_job(__import__('pandas').Timestamp('2026-10-12 07:59', tz='UTC'))[1])"],
                          env={**os.environ, "RLSC_TRANCHES": "0", "MODE": "dry"}, capture_output=True, text=True,
                          cwd=pathlib.Path(A.__file__).parent)
     assert out.stdout.split()[-3:] == ["1", "(0,)", "guard"], out.stdout + out.stderr
-    assert importlib.import_module("autotrade").N == 3
+    assert importlib.import_module("autotrade").N == len(rls.TRANCHES) == 6
     run = lambda coins: subprocess.run([sys.executable, "-c", "import autotrade as A; print(A.COINS, A.CFG['insts'])"],  # noqa: E731
                                        env={**os.environ, "RLSC_COINS": coins, "MODE": "dry"}, capture_output=True, text=True,
                                        cwd=pathlib.Path(A.__file__).parent)
@@ -690,6 +691,39 @@ def bot_open(b, n=100, ks=(0,), side=1):
 
 def flat(b):
     return not b.pos(BTC) and not b.pos(ETH) and not A.open_books()
+
+
+def test_tranche_change_guard():
+    """몫 구성 변경: 열린 몫이 있으면 시작 거부 (장부 #k 가 다른 시각 봉으로 관리되는 것 방지), 없으면 장부 초기화."""
+    b = Bot()
+    try:
+        with tranches(0, 8, 16):
+            bot_open(b, 100, ks=(0, 1))                       # 몫 0 작업이 그날 기준을 먼저 기록
+        A.kv_set("config", {"strategy": {"tranches_utc": [0, 8, 16]}})
+        with tranches(0, 4, 8, 12, 16, 20):
+            prev, busy = A.tranche_busy()
+            assert prev == [0, 8, 16] and f"{BTC}#1" in busy and f"{ETH}#1" in busy, busy
+            try:
+                A.tranche_guard()
+                raise AssertionError("열린 몫이 있으면 시작하지 않는다")
+            except SystemExit:
+                pass
+            assert A.ledger(BTC, 1)["side"] and "시작하지 않음" in b.alerts[-1]
+        with tranches(0, 8, 16):
+            assert A.tranche_busy() == (None, [])            # 원래 구성으로 되돌리면 그대로 운용
+    finally:
+        b.close()
+    b = Bot()
+    try:
+        A.kv_set(A.tkey(BTC, 2), {"side": 0, "sz": 0.0, "stop_n": 0, "blk": 1, "seeded": True})
+        A.kv_set("acct", {"streaks": {"2": 5}, "streak": 5})
+        A.kv_set("config", {"strategy": {"tranches_utc": [0, 8, 16]}})
+        with tranches(*rls.TRANCHES):
+            A.tranche_guard()
+            assert A.ledger(BTC, 2) == {"side": 0, "sz": 0.0, "stop_n": 0, "blk": None}, "edge·seeded 초기화 → 새 경계로 다시 복원"
+            assert "streaks" not in A.kv_get("acct") and A.tranche_busy() == (None, [])
+    finally:
+        b.close()
 
 
 def test_t01_risk_flatten_without_next_job():
@@ -1052,7 +1086,7 @@ def test_t15_live_decisions_match_replay():
             t = t[(t.inst == BTC) & (t.exit_ts < b.m.days[n - 1])]
             # 운용은 손절 체결을 다음 대사 때(이 테스트는 다음 날 t0) 기록 → 손절 청산 시각 = 리플레이 손절일 + 1일
             rep = [(BTC, r.entry_ts, r.exit_ts + pd.Timedelta(days=int(r.why == "sl")), r.side, r.why) for r in t.itertuples()]
-            live = [x for x in live if x[2] < b.m.days[n - 1]]
+            rep, live = ([x for x in v if x[2] < b.m.days[n - 1]] for v in (rep, live))   # 같은 기준(기록 시각)으로 자른다
             assert len(rep) >= 5 and live == rep, (live, rep)
         finally:
             okx.Paper.SLIP = 0.0002
@@ -1063,7 +1097,7 @@ def test_t16_config_hash_no_secrets():
     """T16: 1몫·3몫 설정 해시가 다르고 차이가 필드로 보이며, 유효 설정에 인증 정보가 없다. 대시보드는 해시가 같은 백테스트만 보인다."""
     c1, c3 = rls.strategy_config((0,), 30), rls.strategy_config((0, 8, 16), 30)
     assert rls.config_hash(c1) != rls.config_hash(c3)
-    assert rls.config_diff(c1, c3) == ["margin_per_tranche: 0.02 → 0.006666666666666667", "tranches_utc: [0] → [0, 8, 16]"]
+    assert rls.config_diff(c1, c3) == [f"margin_per_tranche: {rls.MARGIN} → {rls.MARGIN / 3}", "tranches_utc: [0] → [0, 8, 16]"]
     os.environ.update(OKX_API_KEY="SECRET-KEY-123", OKX_API_SECRET="SECRET-S", OKX_API_PASSPHRASE="SECRET-P")
     try:
         txt = json.dumps(A.effective_config())
@@ -1117,7 +1151,7 @@ def test_margin_env():
     run = lambda m: subprocess.run([sys.executable, "-c", "import autotrade as A; print(A.MARGIN, A.CFG['margin_per_tranche'], A.CFG['margin_per_symbol'])"],  # noqa: E731
                                    env={**os.environ, "RLSC_MARGIN": m, "MODE": "dry"}, capture_output=True, text=True, cwd=pathlib.Path(A.__file__).parent)
     out = run("0.03")
-    assert out.stdout.split()[-3:] == ["0.03", "0.01", "0.03"], out.stdout + out.stderr
+    assert out.stdout.split()[-3:] == ["0.03", "0.005", "0.03"], out.stdout + out.stderr     # 기본 6몫
     assert run("0.06").returncode != 0 and "RLSC_MARGIN" in run("0.06").stderr
     assert rls.config_hash(rls.strategy_config(margin=0.03)) != rls.config_hash(rls.strategy_config())
 

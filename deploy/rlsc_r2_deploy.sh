@@ -1,6 +1,7 @@
 #!/bin/bash
-# RLS-C R2 배포: 새 코드(위험 감시 R2) + 3몫(UTC 00·08·16) + 소액 계좌 종목당 증거금 비율.
-# 서버에서:  sudo bash rlsc_r2_deploy.sh            # 비율 자동 = 지금 잔고로 BTC 최소 주문을 맞추는 값 + 5% 여유 (2% 미만이면 2%)
+# RLS-C R2 배포: 새 코드(위험 감시 R2) + 6몫(UTC 00·04·08·12·16·20) + 종목당 증거금 비율 (기본 4%, 2026-10-16).
+# 몫 구성이 바뀌면 열린 몫이 없을 때만 진행된다 (3) 점검이 막는다).
+# 서버에서:  sudo bash rlsc_r2_deploy.sh            # 비율 자동 = 지금 잔고로 BTC 최소 주문을 맞추는 값 + 5% 여유 (4% 미만이면 4%)
 #            sudo bash rlsc_r2_deploy.sh 0.035      # 비율 직접 지정 (0 초과 0.05 이하)
 #            sudo bash rlsc_r2_deploy.sh --rollback <백업 폴더>
 #            sudo env RLSC_TRANCHES=0,8,16 RLSC_COINS=ETH-USDT-SWAP bash rlsc_r2_deploy.sh 0.04   # 소액(≈7 USDT): ETH 만 3몫, 종목당 4%
@@ -8,7 +9,7 @@
 #       → 비율 결정 → HH:15~HH:55 까지 대기 → 정지 → 교체 → systemd drop-in → 시작 → 확인 (실패하면 자동 롤백).
 # 주문·청산·계좌 설정 변경은 하지 않는다. 열린 포지션의 손절은 거래소에 남아 있다 (정지 시간 동안 위험 감시는 없음).
 set -euo pipefail
-TR=${RLSC_TRANCHES:-0,8,16}            # 몫 경계 (UTC 시)
+TR=${RLSC_TRANCHES:-0,4,8,12,16,20}    # 몫 경계 (UTC 시)
 COINS=${RLSC_COINS:-}                  # 비우면 BTC·ETH. 예: ETH-USDT-SWAP
 NT=$(awk -F, '{print NF}' <<<"$TR")
 FIRST=$(cut -d- -f1 <<<"${COINS:-BTC}")  # 자동 비율을 맞출 종목 (첫 종목)
@@ -71,14 +72,14 @@ cp "$BK/rlsc_$MODE.db" "$T/" 2>/dev/null || true
 ln -sf "$WD/.env" "$T/.env"; chown -h "$RUSER" "$T/.env"; chown -R "$RUSER" "$T"
 M=${1:-auto}
 pf() { (cd "$T" && as_user $CENV RLSC_MARGIN="$1" "$PY" autotrade.py --preflight 2>&1 | grep '^\[' ) || true; }
-PF=$(pf "$([ "$M" = auto ] && echo 0.05 || echo "$M")")   # 자동이면 상한 5% 로 먼저 본다 (2% 기본으로 보면 소액 계좌는 최소 자금에서 막힘)
+PF=$(pf "$([ "$M" = auto ] && echo 0.05 || echo "$M")")   # 자동이면 상한 5% 로 먼저 본다 (기본 비율로 보면 소액 계좌는 최소 자금에서 막힘)
 echo "$PF"
 grep -q "점검 통과" <<<"$PF" || { echo "점검 실패 → 중단 (서비스 그대로)"; exit 1; }
 if [ "$M" = auto ]; then
   REQ=$(grep "$FIRST 최소 주문" <<<"$PF" | grep -o '≈ [0-9.]*%' | tail -1 | tr -dc '0-9.')
   [ -n "$REQ" ] || { echo "$FIRST 필요 비율을 읽지 못함 → 비율을 직접 지정해 다시: sudo bash $0 0.03"; exit 1; }
-  M=$("$PY" -c "import math,sys; r=float(sys.argv[1])/100*1.05; m=max(0.02, math.ceil(r*1000)/1000); print(m if m<=0.05 else 'ETH')" "$REQ")
-  if [ "$M" = ETH ]; then echo "   잔고가 작아 5% 안에서는 $FIRST 불가 → 2% 유지 (나머지 종목만 거래)"; M=0.02; fi
+  M=$("$PY" -c "import math,sys; r=float(sys.argv[1])/100*1.05; m=max(0.04, math.ceil(r*1000)/1000); print(m if m<=0.05 else 'ETH')" "$REQ")
+  if [ "$M" = ETH ]; then echo "   잔고가 작아 5% 안에서는 $FIRST 불가 → 4% 유지 (나머지 종목만 거래)"; M=0.04; fi
 fi
 "$PY" -c "import sys; m=float(sys.argv[1]); assert 0<m<=0.05" "$M" || { echo "비율 $M 은 0 초과 0.05 이하"; exit 1; }
 PF=$(pf "$M"); grep -q "점검 통과" <<<"$PF" || { echo "$PF"; echo "비율 $M 로는 점검 실패 (최소 주문 미달 등) → 중단 (서비스 그대로)"; exit 1; }

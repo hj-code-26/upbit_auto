@@ -1,19 +1,20 @@
 """RLS-C v1 자동매매 — 코인 슬리브 (BTC-USDT-SWAP · ETH-USDT-SWAP), OKX 한 계좌, 격리 30x, 헤지(long/short) 모드.
 규칙: rls.py (명세를 바꾸지 않는다). 거래소: okx.py. 과거 백테스트의 사후 탐색 결과이며 수익을 보장하지 않는다.
 
-시각 분할 (기본 3몫, 환경변수 RLSC_TRANCHES): 자본을 몫 수로 나눠 몫마다 다른 일봉 경계(기본 UTC 00 · 08 · 16 = KST 09 · 17 · 01)로
-  같은 규칙을 하루 1번 돌린다. RLSC_TRANCHES=0 이면 1몫 (UTC 00, 자본이 작아 3몫이 최소 주문에 못 미칠 때).
+시각 분할 (기본 6몫, 환경변수 RLSC_TRANCHES): 자본을 몫 수로 나눠 몫마다 다른 일봉 경계(기본 UTC 00·04·08·12·16·20 = KST 09·13·17·21·01·05)로
+  같은 규칙을 하루 1번 돌린다. RLSC_TRANCHES=0 이면 1몫 (UTC 00, 자본이 작아 여러 몫이 최소 주문에 못 미칠 때).
+  몫 구성을 바꾸면 열린 몫이 없을 때만 시작한다 (장부가 순번 #k 로 저장됨 → tranche_guard).
   몫마다 장부·진입가·손절·본전·DROP1·edge 가 따로 있고, 거래소에서는 같은 상품·방향의 몫이 한 포지션으로 합쳐진다.
   손절은 몫마다 자기 수량만큼 따로 건다. 헤지 모드라 몫끼리 롱·숏이 달라도 상쇄되지 않는다.
 작업 (1 락 → 2 확정봉·신호 → 3 거래소 대사 → 4 위험 → 레짐 청산 → DROP1 → 진입 → 본전 → 5 주문 → 6 기록):
   t0 UTC 00:02   자산 기록(00:05 대용)·일손실·킬 → 몫 0 판단·체결
-  t1 UTC 08:02 / t2 UTC 16:02   몫 1 / 몫 2 판단·체결
+  t1~t5 UTC 04·08·12·16·20:02   몫 1~5 판단·체결
   C 규칙 (rls.edge_after · rls.vol_ok): 본전 뒤 손절은 edge 없음, 신호 봉 ATR14/종가 > 8% 면 진입 대기.
   guard 매시 07분  점검만: 대사(손절 체결·강제청산 감지)·몫별 손절 주문 복구. 진입·청산 판단 없음
   risk  RLSC_RISK_POLL_SEC(기본 5초, dry 60초)마다  위험 감시: 자산·입출금 조회 → 일 기준(UTC 00:00 직후 첫 기록)·고점·킬
         → 청산 사유가 있으면 그 자리에서 계좌 단위 비상 청산 (RUNNING → HALTING → FLATTENING → HALTED, 실패 = DEGRADED)
         RLSC_PROTECT_SEC(기본 60초)마다 guard 와 같은 대사·손절 점검.
-위험(R2): 몫당 증거금 = 실현 잔고 2% / 몫 수, 동시 합 ≤ 일 기준 자산 10%. 일 기준 대비 −5% (UTC 날 경계 판정) → 전 몫 즉시 청산,
+위험(R2): 몫당 증거금 = 실현 잔고 × RLSC_MARGIN(기본 4%) / 몫 수, 동시 합 ≤ 일 기준 자산 10%. 일 기준 대비 −5% (UTC 날 경계 판정) → 전 몫 즉시 청산,
       그 UTC 날 진입 없음. 킬: 일별 고점 대비 −35% (상시 판정) → 즉시 전량 청산·정지. 강제청산 1건·몫별 20연패 → 진입 중단.
       거래 손실 > 자산 3% 경보. 조회 실패·수량 불일치·미보호 몫·봇 외 주문·미확정 주문 → 신규 진입 차단 (자동 해제).
       입출금(거래 계정 이체)은 일 기준·고점을 같은 금액만큼 옮긴다 (입금 = 수익, 출금 = 손실로 보지 않음).
@@ -958,7 +959,40 @@ def preflight(ex):
     for inst in set(rls.COINS) - set(COINS):
         if any(s["side"] for s in books(inst).values()):
             bad.append(f"{inst} 에 봇 포지션이 남아 있는데 RLSC_COINS 에서 빠짐 → 관리·손절 점검이 끊긴다. 청산 후 제외")
+    prev, busy = tranche_busy()
+    if busy:
+        bad.append(f"몫 구성 {prev} → {list(TRANCHES)} 변경인데 열린 몫·미확정 주문 {busy} → 청산 후 바꾼다 (장부가 순번으로 저장돼 다른 시각 봉으로 관리됨)")
+    elif prev is not None:
+        info.append(f"몫 구성 {prev} → {list(TRANCHES)} 변경: 시작 때 몫 장부 초기화 (열린 몫 없음)")
     return bad, info
+
+
+def tranche_busy():
+    """지난 실행(kv config)의 몫 구성과 지금 RLSC_TRANCHES 가 다르면 → (이전 구성, 열린 몫·미확정 주문). 같거나 처음이면 (None, [])."""
+    prev = (kv_get("config") or {}).get("strategy", {}).get("tranches_utc")
+    if prev is None or list(prev) == list(TRANCHES):
+        return None, []
+    ks = range(max(len(prev), N))
+    return prev, [tkey(i, k) for i in sorted(set(COINS) | set(rls.COINS)) for k in ks if ledger(i, k).get("side")] + list(kv_get("pending", {}))
+
+
+def tranche_guard():
+    """몫 장부는 순번 #k 로 저장된다. 몫 구성이 바뀌면 같은 #k 가 다른 시각 봉으로 관리되므로
+    열린 몫·미확정 주문이 있으면 시작하지 않고, 없으면 몫 장부(edge·연패 포함)를 비워 새 구성으로 다시 복원한다."""
+    prev, busy = tranche_busy()
+    if busy:
+        alert(f"몫 구성 {prev} → {list(TRANCHES)} 변경인데 열린 몫·미확정 주문 {busy} → 시작하지 않음. "
+              f"먼저 청산하거나 RLSC_TRANCHES={','.join(map(str, prev))} 로 되돌린다")
+        sys.exit(0)                                           # 정상 종료 = systemd 가 재시작하지 않는다
+    if prev is not None:
+        for i in set(COINS) | set(rls.COINS):
+            for k in range(max(len(prev), N)):
+                kv_set(tkey(i, k), None)
+        a = kv_get("acct", {})
+        a.pop("streaks", None), a.pop("streak", None)
+        kv_set("acct", a)
+        kv_set("config", effective_config())
+        log.info("몫 구성 %s → %s: 몫 장부 초기화 (edge 는 다음 몫 작업에서 과거 리플레이로 복원)", prev, list(TRANCHES))
 
 
 # ---------- 실행 ----------
@@ -1028,6 +1062,8 @@ def next_job(now):
 def schedule_forever():
     """몫 작업·점검은 정해진 시각에, 그 사이에는 RISK_POLL 초마다 위험 감시 (같은 프로세스에서 차례로 → 작업과 겹치지 않음).
     다른 프로세스(수동 --job)가 락을 쥐고 있으면 그 감시 1회는 건너뛰고, 락 대기가 길어지면 경보한다."""
+    with lock():
+        tranche_guard()
     cfg = effective_config()
     kv_set("config", cfg)
     log.info("몫 %d개: UTC %s · 위험 감시 %gs · 설정 %s · 코드 %s", N, ", ".join(f"{h:02d}:{RUN_MINUTE:02d}" for h in TRANCHES),
@@ -1112,6 +1148,8 @@ if __name__ == "__main__":
                         + [f"[{MODE}] 점검 {'실패' if bad else '통과'}"]))
         sys.exit(1 if bad else 0)
     if "--job" in sys.argv:
+        with lock():
+            tranche_guard()
         run_job(sys.argv[sys.argv.index("--job") + 1])
     else:
         schedule_forever()
