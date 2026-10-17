@@ -44,15 +44,15 @@ def frame(days, conf, atr_v=2.0, px=100.0, bars=None, index=None):
 def sim(coins=None, stocks_=None, cands=None, **kw):
     """rls.prep 을 항등으로, rls.m5 를 cands(날짜 → 목록) 로 대체해 리플레이."""
     coins, stocks_ = coins or {}, stocks_ or {}
-    old = rls.prep, rls.m5, rls.LEVER, rls.MARGIN
-    rls.prep, rls.LEVER, rls.MARGIN = (lambda d: d), 20, 0.02   # 규칙 테스트의 수치(손절 3%, 동시 한도 5종목 등)는 명세 20x·2% 기준
+    old = rls.prep, rls.m5, rls.LEVER, rls.MARGIN, rls.VOL_TARGET
+    rls.prep, rls.LEVER, rls.MARGIN, rls.VOL_TARGET = (lambda d: d), 20, 0.02, None   # 규칙 테스트의 수치(손절 3%, 동시 한도 5종목 등)는 명세 20x·2%·고정 크기 기준
     rls.m5 = lambda closes, members, listed, n=5: (cands or (lambda d: list(stocks_)))(closes.index[-1])
     try:
         allx = [*coins.values(), *stocks_.values()]
         return rls.simulate(coins, stocks_, lambda d: set(stocks_), set(stocks_), min(x.index[0] for x in allx)
                             + pd.Timedelta(days=1), funding_8h=0, slip=0, **kw)
     finally:
-        rls.prep, rls.m5, rls.LEVER, rls.MARGIN = old
+        rls.prep, rls.m5, rls.LEVER, rls.MARGIN, rls.VOL_TARGET = old
 
 
 def test_conf3_regime_d_to_d1():
@@ -116,6 +116,23 @@ def test_adx_fill():
         assert (rls.prep(d).conf == x.conf0).all()
     finally:
         rls.ADX_FILL = old
+
+
+def test_vol_sizing():
+    """동적 크기: 배수 = clip(4% / ATR%, 0.5, 2). 리플레이·운용 모두 진입 증거금에 곱한다."""
+    assert rls.vol_k(2, 100, 0.04) == 2.0 and rls.vol_k(8, 100, 0.04) == 0.5 and abs(rls.vol_k(5, 100, 0.04) - 0.8) < 1e-12
+    assert rls.vol_k(5, 100, 0) == 1.0
+    eq, t, _ = sim({BTC: frame(5, 1, atr_v=5.0, bars={2: (100, 100, 96, 99)})}, vol_target=0.04)   # 손절로 청산돼 거래 기록
+    assert abs(t.margin.iloc[0] - 0.02 * 0.8) < 1e-9, t.margin.iloc[0]
+    b = Bot()
+    try:
+        rls.VOL_TARGET = 0.04                                  # ATR 2 / 가격 100 = 2% → 배수 2
+        b.sig(0, 100, 1)
+        b.run("t0", 100)
+        p = b.pos()[1]
+        assert 0 <= 10_000 * A.MARGIN / A.N * 2 * 30 - p["sz"] * 0.01 * 100 < 7, p["sz"]
+    finally:
+        b.close()
 
 
 def test_edge_reentry():
@@ -415,7 +432,8 @@ class Bot:
         self.m = Market()
         self.st = {}
         self.px = okx.Paper(self.m, self.st, 10_000, now=lambda: self.m.now)
-        self.old = rls.prep
+        self.old, self.old_vt = rls.prep, rls.VOL_TARGET
+        rls.VOL_TARGET = None                                 # 작업 테스트의 수량은 고정 크기 기준 (동적 크기는 test_vol_sizing)
 
         def prep(d):
             x = self.old(d)
@@ -425,7 +443,7 @@ class Bot:
         rls.prep = prep
 
     def close(self):
-        rls.prep = self.old
+        rls.prep, rls.VOL_TARGET = self.old, self.old_vt
 
     def at(self, n, hour=0, minute=2):
         return A.ms(self.m.days[n]) + hour * 3_600_000 + minute * 60_000

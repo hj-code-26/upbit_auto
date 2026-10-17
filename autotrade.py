@@ -72,6 +72,7 @@ FINAL = ("filled", "canceled", "mmp_canceled")
 SIZE_BUF = 0.001                       # 수량 산정 가격 여유 10bp: 시장가 체결이 이만큼 불리해도 몫 증거금 ≤ 실현 잔고 2%/N
 MARGIN = float(os.environ.get("RLSC_MARGIN", rls.MARGIN))   # 종목당 증거금 비율 (실현 잔고 대비). 몫당 = MARGIN / N
 assert 0 < MARGIN and 2 * MARGIN <= rls.MAX_TOTAL + 1e-12, f"RLSC_MARGIN={MARGIN}: 0 초과, 두 종목 합이 동시 한도 {rls.MAX_TOTAL:.0%} 이하(≤ 5%)"
+rls.VOL_TARGET = float(os.environ.get("RLSC_VOL_TARGET", rls.VOL_TARGET or 0)) or None   # 동적 크기 목표 (0 = 끔: BTC+ETH 다몫은 끄는 편이 낫다)
 CFG = rls.strategy_config(TRANCHES, rls.LEVER, insts=COINS, margin=MARGIN)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s",
@@ -692,7 +693,8 @@ def open_tranche(ex, inst, B, k, side, sig, key, ctx):
     a, s = ctx["a"], B[k]
     m = meta(ex, inst, a)
     L, last = m["L"], ex.ticker(inst)["last"]
-    margin = ctx["realized"] * MARGIN / N                    # 종목당 비율을 몫 수로 나눈다 (몫마다 다시 쓰지 않음)
+    vk = rls.vol_k(sig.atr, sig.close)                       # 동적 크기: 변동성 클 때 작게 (rls.VOL_TARGET)
+    margin = ctx["realized"] * MARGIN / N * vk               # 종목당 비율을 몫 수로 나눈다 (몫마다 다시 쓰지 않음)
     sz = okx.floor_to(margin * L / (m["ctVal"] * last * (1 + SIZE_BUF)), m["lotSz"])   # 체결 슬리피지로 2%/N 을 넘지 않게
     dist = rls.stop_dist(sig.atr, sig.close, L, m["mmr"])
     if ctx["used"] + margin > rls.MAX_TOTAL * ctx["ref_eq"] + 1e-9:
@@ -701,11 +703,11 @@ def open_tranche(ex, inst, B, k, side, sig, key, ctx):
         return False
     if sz < m["minSz"]:
         ctx["flags"].append("below_min")
-        ctx["notes"].append(f"{sym(inst)}#{k} 수량 {sz:g} < 최소 {m['minSz']:g} (몫 증거금 {margin:.4f}) → 건너뜀")
+        ctx["notes"].append(f"{sym(inst)}#{k} 수량 {sz:g} < 최소 {m['minSz']:g} (몫 증거금 {margin:.4f}, 크기 배수 {vk:.2f}) → 건너뜀")
         return False
     why = ("레버리지 > 거래소 최대" if L > m["lever"] else
            "손절 거리 ≤ 0 (청산 거리 부족)" if dist <= 0 else
-           f"증거금 > 실현 잔고 {MARGIN:.2%}/{N}" if sz * m["ctVal"] * last / L > margin + 1e-9 else
+           f"증거금 > 실현 잔고 {MARGIN:.2%}/{N}×{vk:.2f}" if sz * m["ctVal"] * last / L > margin + 1e-9 else
            "가용 증거금 부족" if margin > ctx["avail"] else None)
     if not why:
         ex.set_leverage(inst, L, side)
