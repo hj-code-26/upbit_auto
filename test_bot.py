@@ -135,6 +135,25 @@ def test_vol_sizing():
         b.close()
 
 
+def test_regime5_proto():
+    """프로토타입 정세 1~5: 꾸준한 상승 = 5 → 롱, 레버리지는 청산가가 손절 바깥이 되게, 꾸준한 하락 = 2 이하."""
+    import regime5 as R5
+    for dist in (0.01, 0.03, 0.08):
+        L = R5.lever(dist)
+        assert 1 <= L <= R5.L_CAP and dist < 1 / L - R5.MMR - rls.TAKER, (dist, L)       # 손절이 청산보다 먼저
+    up = np.r_[100 * 1.006 ** np.arange(320)]
+    d = pd.DataFrame({"open": np.r_[up[0], up[:-1]], "close": up}, index=pd.date_range(T0, periods=len(up), freq="D"))
+    d["high"], d["low"] = d[["open", "close"]].max(axis=1) * 1.01, d[["open", "close"]].min(axis=1) * 0.99
+    assert R5.levels(d).iloc[-1] == 5
+    eq, tr = R5.run(d)
+    assert len(tr) == 0 or (tr.side == 1).all()
+    assert eq.iloc[-1] > 1.0, "상승장에서 롱으로 이익"
+    dn = d.iloc[::-1].copy()
+    dn.index = d.index
+    dn["open"], dn["close"] = dn.close, dn.open
+    assert R5.levels(dn).iloc[-1] <= 2
+
+
 def test_edge_reentry():
     # 진입(봉 2) → 봉 3 손절 → BULL 유지 동안 재진입 없음 → 봉 5 NEUTRAL → 봉 6 BULL → 봉 7 재진입
     eq, t, _ = sim({BTC: frame(10, [1, 1, 1, 1, 1, 0, 1, 1, 0, 0], bars={3: (100, 100, 96, 99)})})

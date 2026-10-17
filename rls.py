@@ -100,8 +100,9 @@ def atr(d):
     return tr.ewm(alpha=1 / ATR_N, adjust=False, min_periods=ATR_N).mean()
 
 
-def adx_dir(d):
-    """ADX14 > ADX_FILL 이면 DI 방향(+DI > −DI → 1, 반대 → −1), 아니면 0. Wilder 평활 (alpha = 1/14)."""
+def adx_dir(d, th=None):
+    """ADX14 > th(기본 ADX_FILL) 이면 DI 방향(+DI > −DI → 1, 반대 → −1), 아니면 0. Wilder 평활 (alpha = 1/14)."""
+    th = ADX_FILL if th is None else th
     up, dn = d.high.diff(), -d.low.diff()
     pdm, ndm = up.where((up > dn) & (up > 0), 0.0), dn.where((dn > up) & (dn > 0), 0.0)
     pc = d.close.shift()
@@ -109,7 +110,7 @@ def adx_dir(d):
     w = lambda s: s.ewm(alpha=1 / ATR_N, adjust=False, min_periods=ATR_N).mean()  # noqa: E731
     pdi, ndi = w(pdm) / w(tr), w(ndm) / w(tr)
     adx = w(100 * (pdi - ndi).abs() / (pdi + ndi))
-    return np.sign(pdi - ndi).where(adx > ADX_FILL, 0).fillna(0).astype(int)
+    return np.sign(pdi - ndi).where(adx > th, 0).fillna(0).astype(int)
 
 
 def prep(d):
