@@ -242,7 +242,7 @@ def m5(closes, members, listed, n=M5_N):
 def simulate(coins, stocks, members_at, listed, start, end=None, sleeves=("stock", "coin"), mmr=None,
              funding_8h=FUNDING_8H, slip=SLIP, kill=KILL_DD, daily_loss=DAILY_LOSS, entry_ok=None, tp_atr=None, trail_atr=None,
              fund_adverse=False, be_edge=BE_EDGE, atr_max=ATR_MAX, edge_days=None, edge_atr=None, retry_d1=0, risk=None,
-             max_total=MAX_TOTAL, size_k=None, vol_target=None):
+             max_total=MAX_TOTAL, size_k=None, vol_target=None, lever_fn=None):
     """한 계좌 일봉 리플레이 → (일별 자산 Series [UTC 00:00 기록], 거래 DataFrame, 일별 기록 DataFrame).
     coins: {instId: UTC 일봉}, stocks: {티커: 정규장 조정 일봉}, members_at(day) → NDX 구성종목 집합.
     하루 D: 00:00 자산 기록·일손실(직전 기록 대비 −5% → 코인 지금, 주식 다음 시가 청산·그 시각 진입 없음)·킬
@@ -260,6 +260,7 @@ def simulate(coins, stocks, members_at, listed, start, end=None, sleeves=("stock
     risk=r: 위험 기준 사이징 — 명목 = 실현 잔고 × r / 손절 거리 (손절에 닿으면 잔고 r 손실), 증거금 = 명목 / L. 기본 = 증거금 MARGIN 고정.
     max_total: 동시 증거금 합 상한 (전일 자산 비율).
     vol_target: 동적 크기 목표 (기본 VOL_TARGET, 0 = 끔, 코인만).
+    lever_fn(inst, 신호 봉 행) → 이 거래의 레버리지 (연구용 동적 레버리지, 기본 없음 = LEVER).
     size_k(inst, 신호 봉 행) → 배수: 진입 증거금(= 노출)에 곱한다 (연구용 동적 크기, 기본 없음 = 1).
     ponytail: 일봉 근사 — 주식 무기한 장외·주말 가격(기초 현물로 대체), 같은 날 코인 손절과 주식 체결의 선후는 모른다."""
     mmr = {**SIM_MMR, **(mmr or {})}
@@ -300,22 +301,23 @@ def simulate(coins, stocks, members_at, listed, start, end=None, sleeves=("stock
             blk[i], blk_at[i] = p["side"], (t, fill)
         trades.append({"sleeve": p["sleeve"], "inst": i, "side": p["side"], "entry_ts": p["t0"], "exit_ts": t,
                        "entry": p["entry"], "exit": fill, "margin": p["margin"], "stop_dist": p["dist"], "liq": p["liq"],
-                       "be": p["be_ts"] is not None, "be_ts": p["be_ts"], "why": why, "fee": p["fee"] + fee,
+                       "be": p["be_ts"] is not None, "be_ts": p["be_ts"], "why": why, "lever": p["L"], "fee": p["fee"] + fee,
                        "funding": p["fund"], "pnl": pnl, "pnl_pct": pnl / p["eq0"]})
 
     def enter(i, side, sig, o, sleeve, t, cap):
         """sig = 신호 봉(직전 완결 봉) 행. 반환: 동시 한도로 막혔으면 1."""
         nonlocal cash
-        dist = stop_dist(sig.atr, sig.close, LEVER, mmr[sleeve])
-        margin = (cash * risk / dist / LEVER if risk else cash * MARGIN) * (size_k(i, sig) if size_k else 1.0) \
+        L = lever_fn(i, sig) if lever_fn else LEVER
+        dist = stop_dist(sig.atr, sig.close, L, mmr[sleeve])
+        margin = (cash * risk / dist / L if risk else cash * MARGIN) * (size_k(i, sig) if size_k else 1.0) \
             * (vol_k(sig.atr, sig.close, vol_target) if sleeve == "coin" else 1.0)
         if sum(p["margin"] for p in pos.values()) + margin > cap + 1e-12:
             return 1
         fill, eq0 = o * (1 + side * slip), mark()
-        qty, fee = margin * LEVER / fill, TAKER * margin * LEVER
+        qty, fee = margin * L / fill, TAKER * margin * L
         cash -= fee
         pos[i] = {"side": side, "entry": fill, "qty": qty, "margin": margin, "dist": dist,
-                  "stop": stop_px(side, fill, dist), "liq": fill * (1 - side * liq_dist(LEVER, mmr[sleeve])),
+                  "stop": stop_px(side, fill, dist), "liq": fill * (1 - side * liq_dist(L, mmr[sleeve])), "L": L,
                   "atr_e": sig.atr, "ref": fill if sleeve == "coin" else sig.close, "be_ts": None, "t0": t,
                   "eq0": eq0, "fee": fee, "fund": 0.0, "sleeve": sleeve, "peak": fill,
                   "tp": fill * (1 + side * tp_atr * sig.atr / fill) if tp_atr else None}

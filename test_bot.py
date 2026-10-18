@@ -154,6 +154,29 @@ def test_regime5_proto():
     assert R5.levels(dn).iloc[-1] <= 2
 
 
+def test_dashboard_perf_levels():
+    """대시보드: 수익률(오늘·7일·시작 이후·실현·승률·낙폭)과 몫별 손절·본전·DROP1·강제청산 구간 (보유 / 진입 예정 / 대기)."""
+    import dashboard as D
+    daily = [{"date": f"2026-10-{d:02d}", "equity": e} for d, e in ((1, 10.0), (5, 12.0), (8, 9.0), (9, 11.0))]
+    trades = [{"pnl": 0.5}, {"pnl": -0.2}]
+    p = D.perf(daily, trades, eq_now=11.5, day_eq=11.0)
+    assert abs(p["today"] - (11.5 / 11 - 1)) < 1e-12 and abs(p["total"] - 0.15) < 1e-12 and abs(p["d7"] - (11.5 / 10 - 1)) < 1e-12
+    assert abs(p["mdd"] - 0.25) < 1e-12 and abs(p["realized"] - 0.3) < 1e-12 and p["win"] == 0.5 and D.perf([], []) is None
+    meta = {ETH: {"ctVal": 0.1, "minSz": 0.01, "L": 30, "mmr": 0.004}}
+    held = {"side": -1, "sz": 0.01, "entry": 2500.0, "stop": 2547.0, "ref": 2500.0, "atr_e": 100.0, "be_ts": None}
+    L = D.levels({f"{ETH}#0": held, f"{ETH}#1": {"side": 0, "blk": None}, f"{ETH}#2": {"side": 0, "blk": -1}},
+                 {f"{ETH}#0": [0, -1, 2480.0, 100.0], f"{ETH}#1": [0, -1, 2480.0, 100.0], f"{ETH}#2": [0, -1, 2480.0, 100.0]},
+                 meta, {ETH: 2450.0}, 7.27)
+    h, n, b = L
+    assert h["state"] == "보유" and h["be_px"] == 2400.0 and abs(h["pnl_pct"] - 0.02) < 1e-12 and h["drop1"] == 2580.0
+    assert h["stop_pct"] > 0 and abs(h["loss_at_stop"] - 0.01 * 0.1 * 2450 * (2547 / 2500 - 1)) < 1e-9, h
+    assert h["liq"] > h["stop"], "숏: 강제청산가는 손절가보다 위"
+    assert n["state"].startswith("진입 예정") and n["side"] == -1 and n["stop"] > n["entry"] > n["be_px"]
+    assert abs(n["k"] - rls.vol_k(100.0, 2480.0)) < 1e-12 and abs(n["stop"] / n["entry"] - 1 - rls.stop_dist(100.0, 2480.0, 30, 0.004)) < 1e-12
+    assert n["below_min"] == (7.27 * A.MARGIN / A.N * n["k"] * 30 < 0.01 * 0.1 * 2450), "최소 주문 미달 표시 = 몫 명목 < minSz × ctVal × 가격"
+    assert b["state"].startswith("재진입 제한") and b["side"] == 0
+
+
 def test_edge_reentry():
     # 진입(봉 2) → 봉 3 손절 → BULL 유지 동안 재진입 없음 → 봉 5 NEUTRAL → 봉 6 BULL → 봉 7 재진입
     eq, t, _ = sim({BTC: frame(10, [1, 1, 1, 1, 1, 0, 1, 1, 0, 0], bars={3: (100, 100, 96, 99)})})

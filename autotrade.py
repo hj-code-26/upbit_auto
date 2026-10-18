@@ -851,7 +851,7 @@ def job_tranche(ex, now, ctx, k):
                 ctx["notes"].append(f"{sym(inst)}#{k} 확정 일봉 공백 → 신호 갱신 없이 보유·손절만 유지")
             else:
                 sig = x.loc[sig_day]
-                regimes[tkey(inst, k)] = [int(sig.reg), int(sig.conf)]
+                regimes[tkey(inst, k)] = [int(sig.reg), int(sig.conf), float(sig.close), float(sig.atr)]   # 종가·ATR = 대시보드 손절·본전 구간
                 if s["side"]:
                     why = ("regime" if sig.conf != s["side"] else
                            "drop1" if rls.drop1(s["side"], sig.close, sig.prev, sig.atr) else None)

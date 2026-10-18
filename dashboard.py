@@ -5,12 +5,15 @@ import os
 import pathlib
 import sqlite3
 import threading
+import time
 
 import uvicorn
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 
 import autotrade as A
+import okx
+import rls
 
 app = FastAPI()
 SCHEDULE = os.environ.get("SCHEDULE", "1") != "0"
@@ -28,6 +31,85 @@ def backtest_for(h, root=RUNS):
     return None
 
 
+_PX = {}
+
+
+def price(inst):
+    """공개 시세 last (30초 캐시, 실패하면 직전 값/None). 인증·주문 없음."""
+    t, p = _PX.get(inst, (0.0, None))
+    if time.time() - t > 30:
+        try:
+            p = okx.Client().ticker(inst)["last"]
+        except Exception:  # noqa: BLE001
+            pass
+        _PX[inst] = (time.time(), p)
+    return p
+
+
+def perf(daily, trades, eq_now=None, day_eq=None):
+    """수익률 (입출금 미반영): 오늘(UTC 0시 기준)·7일·30일·시작 이후, 실현 손익·승률, 기록 기준 최대낙폭."""
+    e = A.pd.Series({A.pd.Timestamp(r["date"]): r["equity"] for r in daily if r.get("equity")}).sort_index()
+    if e.empty:
+        return None
+    now = eq_now or e.iloc[-1]
+
+    def back(n):
+        s = e[e.index <= e.index[-1] - A.pd.Timedelta(days=n)]
+        return now / s.iloc[-1] - 1 if len(s) else None
+    done = [t for t in trades if t.get("pnl") is not None]
+    return {"equity": now, "start_eq": float(e.iloc[0]), "start_date": str(e.index[0].date()), "today": now / (day_eq or e.iloc[-1]) - 1,
+            "d7": back(7), "d30": back(30), "total": now / e.iloc[0] - 1, "mdd": float((1 - e / e.cummax()).max()),
+            "realized": sum(t["pnl"] for t in done), "n": len(done), "win": sum(t["pnl"] > 0 for t in done) / len(done) if done else None}
+
+
+def levels(ledger, regimes, meta, prices, eq):
+    """몫마다 손절·본전 이동(이익 보호)·DROP1 기준·강제청산가. 보유 중이면 장부 값, 신호만 있으면 지금 가격에 진입할 때 예상값.
+    고정 익절은 없다 — 이익은 본전 이동 뒤 추세가 꺾일 때(DROP1·레짐) 정리된다."""
+    out = []
+    for key, s in ledger.items():
+        inst = key.split("#")[0]
+        m, px, r = meta.get(inst, {}), prices.get(inst), regimes.get(key) or []
+        conf = r[1] if len(r) > 1 else 0
+        close, atr = (r[2], r[3]) if len(r) > 3 else (None, None)
+        L, mmr, ct = m.get("L", rls.LEVER), m.get("mmr", rls.SIM_MMR["coin"]), m.get("ctVal")
+        row = {"key": key, "price": px, "conf": conf, "side": 0}
+        if s.get("side"):
+            side, entry = s["side"], s["entry"]
+            row |= {"state": "보유", "side": side, "entry": entry, "stop": s["stop"], "be_done": bool(s.get("be_ts")),
+                    "be_px": s.get("ref", entry) + side * rls.BE_ATR * s.get("atr_e", 0),
+                    "liq": (s.get("trade") or {}).get("liq_px") or entry * (1 - side * rls.liq_dist(L, mmr)),
+                    "notional": s["sz"] * ct * (px or entry) if ct else None}
+        elif not conf:
+            out.append(row | {"state": "대기 (신호 없음)"})
+            continue
+        elif conf == s.get("blk"):
+            out.append(row | {"state": "재진입 제한 (신호가 꺼졌다 켜져야 진입)"})
+            continue
+        elif not (atr and close and px):
+            out.append(row | {"state": "신호 있음 (가격·ATR 기록 전)"})
+            continue
+        elif not rls.vol_ok(atr, close):
+            out.append(row | {"state": f"변동성 대기 (ATR {atr / close:.1%} > {rls.ATR_MAX:.0%})"})
+            continue
+        else:
+            side, entry, k = conf, px, rls.vol_k(atr, close)
+            dist = rls.stop_dist(atr, close, L, mmr)
+            notional = eq * A.MARGIN / A.N * k * L if eq else None
+            row |= {"state": "진입 예정 (예상값)", "side": side, "entry": entry,
+                    "stop": rls.stop_px(side, entry, dist), "be_done": False, "be_px": entry + side * rls.BE_ATR * atr,
+                    "liq": entry * (1 - side * rls.liq_dist(L, mmr)), "notional": notional, "k": k,
+                    "below_min": bool(ct and notional is not None and notional < m.get("minSz", 0) * ct * entry)}
+        row["be_stop"] = rls.be_px(side, row["entry"])
+        row["stop_pct"] = row["stop"] / row["entry"] - 1
+        row["be_pct"] = row["be_px"] / row["entry"] - 1
+        row["loss_at_stop"] = row["notional"] * abs(row["stop_pct"]) if row["notional"] else None
+        row["loss_at_stop_eq"] = row["loss_at_stop"] / eq if eq and row["loss_at_stop"] else None
+        row["pnl_pct"] = side * (px / row["entry"] - 1) if px and s.get("side") else None
+        row["drop1"] = close - side * rls.DROP_ATR * atr if close and atr else None
+        out.append(row)
+    return out
+
+
 def rows(sql):
     with A.db() as c:
         c.row_factory = sqlite3.Row
@@ -38,14 +120,17 @@ def rows(sql):
 def api_state():
     cfg = A.kv_get("config") or A.effective_config()
     r = A.risk_get()
+    daily, trades = rows("SELECT * FROM daily ORDER BY date"), rows("SELECT * FROM trades ORDER BY exit_ts DESC LIMIT 200")
+    ob, acct, regimes = A.kv_get("okx_balance"), A.kv_get("acct", {}), A.kv_get("regimes", {})
+    ledger = {A.tkey(i, k): A.ledger(i, k) for i in A.COINS for k in range(A.N)}
+    eq = (ob or {}).get("eq") or (daily[-1]["equity"] if daily else None)
+    lv = levels(ledger, regimes, acct.get("meta", {}), {i: price(i) for i in A.COINS}, eq)
     return {"mode": A.MODE, "schedule": SCHEDULE, "config": cfg, "backtest": backtest_for(cfg["strategy_hash"]),
             "risk": {**r, "label": STATE_TXT.get(r["state"], r["state"]),
                      "entry_blocks": A.entry_blocks(r, A.dt.datetime.now(A.dt.UTC), A.kv_get("acct", {}))},
-            "daily": rows("SELECT * FROM daily ORDER BY date"),
-            "trades": rows("SELECT * FROM trades ORDER BY exit_ts DESC LIMIT 200"),
+            "daily": daily, "trades": trades, "perf": perf(daily, trades, eq, (r.get("day") or {}).get("eq")), "levels": lv,
             "orders": rows("SELECT * FROM orders ORDER BY ts DESC LIMIT 100"),
-            "acct": A.kv_get("acct", {}), "regimes": A.kv_get("regimes", {}), "okx": A.kv_get("okx_balance"), "tranches": A.TRANCHES,
-            "ledger": {A.tkey(i, k): A.ledger(i, k) for i in A.COINS for k in range(A.N)}, "forward": forward_json()}
+            "acct": acct, "regimes": regimes, "okx": ob, "tranches": A.TRANCHES, "ledger": ledger, "forward": forward_json()}
 
 
 def forward_json():
@@ -66,8 +151,12 @@ body{margin:0;background:var(--bg);color:var(--t1);font-family:-apple-system,sys
 .wrap{max-width:1100px;margin:0 auto;padding:20px 16px 60px}.card{background:var(--card);border-radius:16px;padding:20px;margin-bottom:12px;overflow-x:auto}
 h1{font-size:20px}h2{font-size:16px;margin:0 0 12px}table{border-collapse:collapse;width:100%;font-size:13px}
 td,th{padding:6px 8px;text-align:right;white-space:nowrap;border-bottom:1px solid var(--bg)}th{color:var(--t3);font-weight:500}td:first-child,th:first-child{text-align:left}
-.L{color:var(--red)}.S{color:var(--blue)}.f{color:#e67e22}
+.L{color:var(--red)}.S{color:var(--blue)}.f{color:#e67e22}.g{color:#12b886}
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:10px}.tile{background:var(--bg);border-radius:12px;padding:12px}
+.tile b{display:block;font-size:20px;margin-top:4px}.tile span{font-size:12px;color:var(--t3)}
 </style><div class=wrap><h1>RLS-C v1 <span id=mode style="font-size:14px;color:var(--t3)"></span></h1>
+<div class=card><h2>수익률 <span style="font-size:13px;color:var(--t3);font-weight:400">입출금 미반영 · 일별 기록 기준</span></h2><div id=perf class=tiles></div></div>
+<div class=card><h2>손절 · 이익 보호 구간 <span style="font-size:13px;color:var(--t3);font-weight:400">고정 익절 없음 — 본전 이동 뒤 추세가 꺾일 때(DROP1·레짐) 청산</span></h2><div id=lv></div></div>
 <div class=card id=now></div><div class=card><h2>가격 범위와 진입 기준 <span style="font-size:13px;color:var(--t3);font-weight:400">예측 아님 · 최근 60일 변동성이 이어진다고 볼 때의 범위</span></h2><canvas id=ol height=110></canvas><div id=olt style="margin-top:12px"></div></div><div class=card><h2>자산 vs 같은 기간 기준선 (시작 대비 %)</h2><canvas id=chart height=90></canvas></div>
 <div class=card><h2>거래</h2><table id=trades></table></div><div class=card><h2>일별 기록</h2><table id=daily></table></div><div class=card><h2>주문</h2><table id=orders></table></div></div>
 <script>
@@ -75,7 +164,7 @@ const f=(x,d=2)=>x==null?'-':Number(x).toLocaleString('ko-KR',{maximumFractionDi
 const S={1:'<span class=L>롱/BULL</span>','-1':'<span class=S>숏/BEAR</span>',0:'-',null:'-',undefined:'-'};
 let chart,olc;
 const kst=t=>{if(!t)return '-';const d=new Date(Date.parse(t+'Z')+9*3600e3);return `${d.getUTCMonth()+1}/${d.getUTCDate()} ${String(d.getUTCHours()).padStart(2,'0')}:02`};
-function drawOutlook(fw){
+function drawOutlook(fw,LV){
   const el=document.getElementById('olt'),O=fw&&fw.outlook&&Object.entries(fw.outlook)[0];
   if(!O){el.textContent=fw&&fw.outlook_error?'계산 실패: '+fw.outlook_error:'아직 없음 (실거래 검증이 하루 3번 계산)';return}
   const [inst,o]=O,h=o.hist,u=o.fut,n=h.date.length,pad=a=>Array(n).fill(null).concat(a),sb=o.tranches.map(t=>t.short_below).filter(v=>v);
@@ -85,6 +174,9 @@ function drawOutlook(fw){
   ds.push({label:inst.split('-')[0]+' 종가',data:h.close,borderColor:'#3182f6',borderWidth:2,pointRadius:0},
     {label:'SMA50 = 롱 기준 (오른쪽은 가격 유지 가정)',data:h.sma.concat(u.sma_flat),borderColor:'#8b95a1',borderWidth:2,borderDash:[6,4],pointRadius:0},
     {label:'숏 기준 (이 아래 유지)',data:pad(u.date.map(()=>sb.length?Math.max(...sb):null)),borderColor:'#e67e22',borderWidth:2,borderDash:[2,3],pointRadius:0});
+  (LV||[]).filter(r=>r.side&&r.key.startsWith(inst)).forEach(r=>{const tag=r.key.split('#')[1]+(r.state==='보유'?'':' 예상'),line=v=>pad(u.date.map(()=>v));
+    ds.push({label:`#${tag} 손절 ${f(r.stop,0)}`,data:line(r.stop),borderColor:'#3182f6',borderWidth:1.5,borderDash:[8,3],pointRadius:0},
+            {label:`#${tag} 본전 이동 ${f(r.be_px,0)}`,data:line(r.be_done?null:r.be_px),borderColor:'#12b886',borderWidth:1.5,borderDash:[8,3],pointRadius:0})});
   const data={labels:h.date.concat(u.date),datasets:ds},opt={animation:false,spanGaps:true,interaction:{mode:'index',intersect:false},
     plugins:{legend:{labels:{filter:i=>!/하단|상단/.test(i.text)||/68% 상단|95% 상단/.test(i.text)}},tooltip:{filter:i=>i.raw!=null}}};
   if(olc){olc.data=data;olc.update()}else olc=new Chart(document.getElementById('ol'),{type:'line',data,options:opt});
@@ -93,6 +185,27 @@ function drawOutlook(fw){
     '<table><tr><th>몫 (판단 KST)</th><th>롱: 종가 ≥ (3일)</th><th>숏: 종가 ≤ 유지</th>'+lv.map((l,j)=>`<th>${l}<br>${px[j]}</th>`).join('')+'</tr>'+
     o.tranches.map((t,k)=>`<tr><td>#${k} (${String((t.off+9)%24).padStart(2,'0')}:02)</td><td>${f(t.long_above,0)}</td><td>${f(t.short_below,0)}</td>`+
       t.scen.map(c=>`<td>${c.side?`<span class=${c.side>0?'L':'S'}>${c.side>0?'롱':'숏'}</span> ${kst(c.at)}`:'-'}</td>`).join('')+'</tr>').join('')+'</table>';
+}
+const sp=x=>x==null?'-':(x>0?'+':'')+(x*100).toFixed(2)+'%',pc=x=>x==null?'-':`<span class=${x>0?'L':x<0?'S':''}>${x>0?'+':''}${(x*100).toFixed(2)}%</span>`;
+function drawPerf(p){
+  const el=document.getElementById('perf');
+  if(!p){el.textContent='기록 없음';return}
+  const T=[['현재 자산',f(p.equity,4)+' USDT'],['오늘 (UTC 0시 대비)',pc(p.today)],['7일',pc(p.d7)],['30일',pc(p.d30)],
+    [`시작 이후 (${p.start_date}, ${f(p.start_eq,2)})`,pc(p.total)],['실현 손익',`${p.realized>0?'+':''}${f(p.realized,4)} USDT`],
+    ['거래 · 승률',`${p.n}건 · ${p.win==null?'-':(p.win*100).toFixed(0)+'%'}`],['최대낙폭 (기록 기준)',P(-p.mdd)]];
+  el.innerHTML=T.map(([k,v])=>`<div class=tile><span>${k}</span><b>${v}</b></div>`).join('');
+}
+function drawLevels(L){
+  const el=document.getElementById('lv'),sm=t=>`<br><span style="font-size:12px;color:var(--t3)">${t}</span>`,nm=k=>k.replace('-USDT-SWAP','');
+  el.innerHTML='<table><tr><th>몫 · 상태</th><th>방향</th><th>진입가</th><th>손절</th><th>본전 이동 (이익 보호)</th><th>DROP1 청산</th><th>강제청산</th></tr>'+
+    L.map(r=>!r.side?`<tr><td>${nm(r.key)}${sm(r.state)}</td><td>-</td><td>-${sm('현재 '+f(r.price,2))}</td><td colspan=4></td></tr>`:
+      `<tr><td>${nm(r.key)}${sm(r.state+(r.k?` · 크기 ×${r.k.toFixed(2)}`:'')+(r.below_min?' · <span class=f>최소 주문 미달</span>':''))}</td><td>${S[r.side]}</td>`+
+      `<td>${f(r.entry,2)}${sm('현재 '+f(r.price,2)+(r.pnl_pct==null?'':' · '+pc(r.pnl_pct)))}</td>`+
+      `<td class=S>${f(r.stop,2)}${sm(sp(r.stop_pct)+(r.loss_at_stop==null?'':` · 손실 ${f(r.loss_at_stop,3)} USDT (${P(r.loss_at_stop_eq)})`))}</td>`+
+      `<td class=g>${r.be_done?'완료':f(r.be_px,2)}${sm(r.be_done?'손절이 본전 위로 이동함':sp(r.be_pct)+' 도달 시 → 손절 '+f(r.be_stop,2))}</td>`+
+      `<td>${r.drop1==null?'-':(r.side>0?'종가 ≤ ':'종가 ≥ ')+f(r.drop1,2)}${sm('다음 판단 시각 종가')}</td><td>${f(r.liq,2)}</td></tr>`).join('')+'</table>'+
+    '<p style="font-size:12px;color:var(--t3);margin:8px 0 0">손절 = 거래소에 걸린 손절 (닿으면 즉시 청산) · 본전 이동 = 몫 판단 시각 종가가 이 가격을 넘으면 손절을 진입가 ±0.15% 로 옮겨 그 뒤로는 손실 없이 추세를 탐 · '+
+    'DROP1 = 다음 판단 시각 종가가 이 너머면 다음 시가에 청산 · "진입 예정"은 지금 가격에 들어갈 때의 예상값</p>';
 }
 async function load(){
   const s=await (await fetch('/api/state')).json(),a=s.acct;
@@ -117,7 +230,7 @@ async function load(){
   const K=[['equity','계좌',r=>(r.equity/e0-1)*100],['stock_only','주식만',r=>r.stock_only*100],['coin_only','코인만',r=>r.coin_only*100],['btc_hold','BTC 1x',r=>r.btc_hold*100]];
   const data={labels:d.map(r=>r.date),datasets:K.map(([k,n,g],j)=>({label:n,data:d.map(r=>r[k]==null?null:g(r)),borderColor:C[j],pointRadius:0,borderWidth:2}))};
   if(chart){chart.data=data;chart.update()}else chart=new Chart(document.getElementById('chart'),{type:'line',data,options:{animation:false,spanGaps:true}});
-  drawOutlook(s.forward);
+  drawOutlook(s.forward,s.levels);drawPerf(s.perf);drawLevels(s.levels||[]);
 }
 load();setInterval(load,60000);
 </script></html>"""
