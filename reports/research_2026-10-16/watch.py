@@ -16,11 +16,14 @@ def signals(h):
         rows.append(x[["t", "conf", "atr", "close", "prev"]])
     return pd.concat(rows).set_index("t").sort_index()
 
-def run(h, hours, start, end, L=30, margin=0.04):
+def run(h, hours, start, end, L=30, margin=0.04, limit=None, S=None):
+    """limit=(x, W, fallback): 판단 시각에 시장가 대신 지정가 (숏은 시가 + x×ATR 위, 롱은 아래). W 시간 안에 닿으면 그 가격 체결(maker),
+    못 닿으면 fallback=True 면 W 시간 뒤 시가에 시장가, False 면 그 진입은 건너뛴다. 체결 봉에서 손절가까지 닿았으면 손절로 본다(보수적)."""
     b = h.assign(t=pd.to_datetime(h.ts, unit="ms")).set_index("t")[["open", "high", "low", "close"]].astype(float)
     b = b[(b.index >= pd.Timestamp(start)) & (b.index <= pd.Timestamp(end))]
-    S = signals(h)
-    mmr, cash, pos, blk, pend = rls.SIM_MMR["coin"], 1.0, None, None, None
+    S = signals(h) if S is None else S
+    mmr, cash, pos, blk, pend, lim = rls.SIM_MMR["coin"], 1.0, None, None, None, None
+    stats = {"orders": 0, "filled": 0, "fallback": 0, "missed": 0}
     eqs, trades = {}, []
 
     def close(px, why, t):
@@ -43,11 +46,29 @@ def run(h, hours, start, end, L=30, margin=0.04):
                 close(r.open, "regime", t)
         if sig is not None and blk is not None and sig.conf != blk and t.hour in hours:
             blk = None
-        if pos is None and sig is not None and t.hour in hours and sig.conf and sig.conf != blk \
+        go = None
+        if pos is None and lim is not None:                           # 걸어 둔 지정가: 이 봉에서 닿으면 체결
+            if (r.high >= lim["px"]) if lim["side"] < 0 else (r.low <= lim["px"]):
+                go = (lim["side"], lim["sig"], lim["px"], rls.MAKER if hasattr(rls, "MAKER") else 0.0002); stats["filled"] += 1; lim = None
+            elif t >= lim["until"]:
+                if limit[2]:
+                    go = (lim["side"], lim["sig"], r.open * (1 + lim["side"] * rls.SLIP), rls.TAKER); stats["fallback"] += 1
+                else:
+                    stats["missed"] += 1
+                lim = None
+        if go is None and pos is None and lim is None and sig is not None and t.hour in hours and sig.conf and sig.conf != blk \
                 and not np.isnan(sig.atr) and rls.vol_ok(sig.atr, sig.close):
-            side = int(sig.conf); dist = rls.stop_dist(sig.atr, sig.close, L, mmr)
+            if limit:
+                stats["orders"] += 1
+                lim = {"side": int(sig.conf), "sig": sig, "px": r.open - int(sig.conf) * limit[0] * sig.atr, "until": t + pd.Timedelta(hours=limit[1])}
+                if (r.high >= lim["px"]) if lim["side"] < 0 else (r.low <= lim["px"]):
+                    go = (lim["side"], sig, lim["px"], 0.0002); stats["filled"] += 1; lim = None
+            else:
+                go = (int(sig.conf), sig, r.open * (1 + int(sig.conf) * rls.SLIP), rls.TAKER)
+        if go:
+            side, sig, fill, fee_rate = go; dist = rls.stop_dist(sig.atr, sig.close, L, mmr)
             m = cash * margin * rls.vol_k(sig.atr, sig.close)
-            fill = r.open * (1 + side * rls.SLIP); fee = rls.TAKER * m * L; cash -= fee
+            fee = fee_rate * m * L; cash -= fee
             pos = {"side": side, "entry": fill, "qty": m * L / fill, "stop": rls.stop_px(side, fill, dist), "atr_e": sig.atr,
                    "be": False, "h0": t.hour, "t0": t, "fee": fee, "fund": 0.0, "eq0": cash + fee}
         if pos and (r.low <= pos["stop"] if pos["side"] > 0 else r.high >= pos["stop"]):
@@ -64,6 +85,7 @@ def run(h, hours, start, end, L=30, margin=0.04):
                     pos["stop"] = rls.tighten(pos["side"], pos["stop"], rls.be_px(pos["side"], pos["entry"])); pos["be"] = True
         eqs[t] = cash + (pos["side"] * pos["qty"] * (r.close - pos["entry"]) if pos else 0.0)
     eq = pd.Series(eqs)
+    run.stats = stats
     return eq.groupby(eq.index.normalize()).last(), pd.DataFrame(trades)
 
 MODES = {"하루 1번 (00)": {0}, "하루 3번 (00·08·16)": {0, 8, 16}, "6번 (4시간마다)": {0, 4, 8, 12, 16, 20}, "매시간 (즉시)": set(range(24))}
