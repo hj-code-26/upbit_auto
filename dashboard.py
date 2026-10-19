@@ -34,6 +34,24 @@ def backtest_for(h, root=RUNS):
 _PX = {}
 
 
+_SHAPE = {}
+
+
+def shape(inst, off):
+    """신호 봉(그 몫 경계의 마지막 확정 일봉) 폭/ATR · SMA50 20일 기울기 % — 봇 기록에 없을 때(옛 봇 코드) 공개 4H 봉으로 계산.
+    15분 캐시, 실패하면 None (표시만 빠짐). 인증·주문 없음."""
+    t, v = _SHAPE.get((inst, off), (0.0, None))
+    if time.time() - t > 900:
+        try:
+            d = A.bars(okx.Client(), inst, A.dt.datetime.now(A.dt.UTC), off)
+            s50, atr = d.close.rolling(rls.SMA).mean(), rls.atr(d)
+            v = (float((d.high.iloc[-1] - d.low.iloc[-1]) / atr.iloc[-1]), float(100 * (s50.iloc[-1] / s50.iloc[-1 - rls.SLOPE] - 1)))
+        except Exception:  # noqa: BLE001
+            pass
+        _SHAPE[(inst, off)] = (time.time(), v)
+    return v
+
+
 def price(inst):
     """공개 시세 last (30초 캐시, 실패하면 직전 값/None). 인증·주문 없음."""
     t, p = _PX.get(inst, (0.0, None))
@@ -137,7 +155,13 @@ def api_state():
     ob, acct, regimes = A.kv_get("okx_balance"), A.kv_get("acct", {}), A.kv_get("regimes", {})
     ledger = {A.tkey(i, k): A.ledger(i, k) for i in A.COINS for k in range(A.N)}
     eq = (ob or {}).get("eq") or (daily[-1]["equity"] if daily else None)
-    lv = levels(ledger, regimes, acct.get("meta", {}), {i: price(i) for i in A.COINS}, eq)
+    shown = dict(regimes)                                     # 시장 표시용: 옛 봇 기록(4칸)이면 폭·기울기를 공개 봉으로 채운다
+    for i in A.COINS:
+        for k in range(A.N):
+            r = shown.get(A.tkey(i, k)) or []
+            if len(r) < 6 and (v := shape(i, A.TRANCHES[k])):
+                shown[A.tkey(i, k)] = (list(r) + [None] * 4)[:4] + list(v)
+    lv = levels(ledger, shown, acct.get("meta", {}), {i: price(i) for i in A.COINS}, eq)
     return {"mode": A.MODE, "schedule": SCHEDULE, "config": cfg, "backtest": backtest_for(cfg["strategy_hash"]),
             "risk": {**r, "label": STATE_TXT.get(r["state"], r["state"]),
                      "entry_blocks": A.entry_blocks(r, A.dt.datetime.now(A.dt.UTC), A.kv_get("acct", {}))},
