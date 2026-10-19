@@ -177,6 +177,14 @@ def test_dashboard_perf_levels():
     assert b["state"].startswith("재진입 제한") and b["side"] == 0
 
 
+def test_market_state():
+    """대시보드 시장 상태 (표시만): 좁은 봉 < 0.6 ATR · 진입 방향 SMA50 기울기 > 6%. 매매 크기는 바뀌지 않는다 (test_vol_sizing)."""
+    import dashboard as D
+    assert D.market_state([0, 1, 1.0, 1.0, 0.5, 7.0], 1).count("·") == 1
+    assert D.market_state([0, -1, 1.0, 1.0, 0.9, 7.0], -1) == "" and D.market_state([0, 1, 1.0, 1.0], 1) == ""
+    assert "과열" in D.market_state([0, 0, 1.0, 1.0, 0.9, -7.0], 0)
+
+
 def test_edge_reentry():
     # 진입(봉 2) → 봉 3 손절 → BULL 유지 동안 재진입 없음 → 봉 5 NEUTRAL → 봉 6 BULL → 봉 7 재진입
     eq, t, _ = sim({BTC: frame(10, [1, 1, 1, 1, 1, 0, 1, 1, 0, 0], bars={3: (100, 100, 96, 99)})})
@@ -771,34 +779,52 @@ def flat(b):
 
 
 def test_tranche_change_guard():
-    """몫 구성 변경: 열린 몫이 있으면 시작 거부 (장부 #k 가 다른 시각 봉으로 관리되는 것 방지), 없으면 장부 초기화."""
+    """몫 구성 변경: 장부를 같은 UTC 시각 몫으로 옮긴다 (열린 포지션·손절 주문 ID·edge·연패 그대로, 새 시각은 빈 장부).
+    새 구성에 없는 시각에 열린 몫이 있으면 시작 거부 (장부 #k 가 다른 시각 봉으로 관리되는 것 방지)."""
     b = Bot()
     try:
         with tranches(0, 8, 16):
             bot_open(b, 100, ks=(0, 1))                       # 몫 0 작업이 그날 기준을 먼저 기록
+            old = {(i, k): A.ledger(i, k) for i in (BTC, ETH) for k in (0, 1)}
+            sz = {i: b.pos(i)[1]["sz"] for i in (BTC, ETH)}
         A.kv_set("config", {"strategy": {"tranches_utc": [0, 8, 16]}})
-        with tranches(0, 4, 8, 12, 16, 20):
+        with tranches(4, 12, 20):                             # 열린 몫의 시각(00·08)이 새 구성에 없음 → 거부
             prev, busy = A.tranche_busy()
-            assert prev == [0, 8, 16] and f"{BTC}#1" in busy and f"{ETH}#1" in busy, busy
+            assert prev == [0, 8, 16] and f"{BTC}#0" in busy and f"{ETH}#1" in busy, busy
             try:
                 A.tranche_guard()
-                raise AssertionError("열린 몫이 있으면 시작하지 않는다")
+                raise AssertionError("없어지는 시각에 열린 몫이 있으면 시작하지 않는다")
             except SystemExit:
                 pass
             assert A.ledger(BTC, 1)["side"] and "시작하지 않음" in b.alerts[-1]
         with tranches(0, 8, 16):
             assert A.tranche_busy() == (None, [])            # 원래 구성으로 되돌리면 그대로 운용
+        with tranches(*rls.TRANCHES):                         # 00·08·16 → 00·04·08·12·16·20: #0 → #0, #1 → #2
+            assert A.tranche_busy() == ([0, 8, 16], [])
+            A.tranche_guard()
+            for i in (BTC, ETH):
+                assert A.ledger(i, 0) == old[(i, 0)] and A.ledger(i, 2) == old[(i, 1)], "같은 UTC 시각 몫으로 그대로"
+                assert not A.ledger(i, 1)["side"] and not A.ledger(i, 4)["side"], "새 시각(04)·옛 16시 몫은 빈 장부"
+                assert b.pos(i)[1]["sz"] == sz[i], "거래소 포지션은 건드리지 않는다"
+            assert A.kv_get("config")["strategy"]["tranches_utc"] == list(rls.TRANCHES) and A.tranche_busy() == (None, [])
+            assert "#1→#2" in b.alerts[-1]
+            n = len(b.alerts)
+            b.run("guard", 100, hour=9, minute=A.GUARD_MINUTE)  # 옮긴 장부의 손절 주문 ID 를 거래소 손절과 맞춰 본다
+            assert not [x for x in b.alerts[n:] if "손절" in x], b.alerts[n:]
+            assert A.ledger(BTC, 2)["stop_cid"] == old[(BTC, 1)]["stop_cid"], "손절 재설정 없이 그대로 보호"
     finally:
         b.close()
     b = Bot()
     try:
         A.kv_set(A.tkey(BTC, 2), {"side": 0, "sz": 0.0, "stop_n": 0, "blk": 1, "seeded": True})
-        A.kv_set("acct", {"streaks": {"2": 5}, "streak": 5})
+        A.kv_set("acct", {"streaks": {"2": 5, "1": 3}, "streak": 5})
         A.kv_set("config", {"strategy": {"tranches_utc": [0, 8, 16]}})
         with tranches(*rls.TRANCHES):
             A.tranche_guard()
-            assert A.ledger(BTC, 2) == {"side": 0, "sz": 0.0, "stop_n": 0, "blk": None}, "edge·seeded 초기화 → 새 경계로 다시 복원"
-            assert "streaks" not in A.kv_get("acct") and A.tranche_busy() == (None, [])
+            assert A.ledger(BTC, 4)["blk"] == 1 and A.ledger(BTC, 4)["seeded"], "16시 몫의 edge 는 같은 16시 몫(#4)으로"
+            assert A.ledger(BTC, 2) == {"side": 0, "sz": 0.0, "stop_n": 0, "blk": None}
+            assert A.kv_get("acct")["streaks"] == {"4": 5, "2": 3} and A.kv_get("acct")["streak"] == 5
+            assert A.tranche_busy() == (None, [])
     finally:
         b.close()
 

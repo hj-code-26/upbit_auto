@@ -1,19 +1,22 @@
 #!/bin/bash
 # RLS-C R2 배포: 새 코드(위험 감시 R2) + 6몫(UTC 00·04·08·12·16·20) + 종목당 증거금 비율 (기본 4%, 2026-10-16).
-# 몫 구성이 바뀌면 열린 몫이 없을 때만 진행된다 (3) 점검이 막는다).
+# 몫 구성이 바뀌면 열린 몫은 같은 UTC 시각 몫으로 옮겨진다. 새 구성에 없는 시각에 열린 몫이 있으면 3) 점검이 막는다.
 # 서버에서:  sudo bash rlsc_r2_deploy.sh            # 비율 자동 = 지금 잔고로 BTC 최소 주문을 맞추는 값 + 5% 여유 (4% 미만이면 4%)
 #            sudo bash rlsc_r2_deploy.sh 0.035      # 비율 직접 지정 (0 초과 0.05 이하)
 #            sudo bash rlsc_r2_deploy.sh --rollback <백업 폴더>
 #            sudo env RLSC_TRANCHES=0,8,16 RLSC_COINS=ETH-USDT-SWAP bash rlsc_r2_deploy.sh 0.04   # 소액(≈7 USDT): ETH 만 3몫, 종목당 4%
+#            sudo env RLSC_TRANCHES=0,4,8,12,16,20 RLSC_COINS=BTC-USDT-SWAP,ETH-USDT-SWAP,ZEC-USDT-SWAP RLSC_VOL_TARGET=0 bash rlsc_r2_deploy.sh 0.04
+#                                                   # 2026-10-19: BTC+ETH+ZEC 6몫 4% 고정 크기 (3몫 00·08·16 열린 몫은 #0·#2·#4 로 옮김, 실현 잔고 ≥ 약 60 USDT)
 # 순서: 서비스 정보 확인 → 새 코드 테스트(임시 폴더) → 백업 → 새 코드로 조회만 하는 점검(--preflight, 임시 폴더·DB 사본)
 #       → 비율 결정 → HH:15~HH:55 까지 대기 → 정지 → 교체 → systemd drop-in → 시작 → 확인 (실패하면 자동 롤백).
 # 주문·청산·계좌 설정 변경은 하지 않는다. 열린 포지션의 손절은 거래소에 남아 있다 (정지 시간 동안 위험 감시는 없음).
 set -euo pipefail
 TR=${RLSC_TRANCHES:-0,4,8,12,16,20}    # 몫 경계 (UTC 시)
 COINS=${RLSC_COINS:-}                  # 비우면 BTC·ETH. 예: ETH-USDT-SWAP
+VOLT=${RLSC_VOL_TARGET:-}              # 비우면 코드 기본 (동적 크기 4%). 0 = 고정 크기
 NT=$(awk -F, '{print NF}' <<<"$TR")
 FIRST=$(cut -d- -f1 <<<"${COINS:-BTC}")  # 자동 비율을 맞출 종목 (첫 종목)
-CENV="RLSC_TRANCHES=$TR${COINS:+ RLSC_COINS=$COINS}"
+CENV="RLSC_TRANCHES=$TR${COINS:+ RLSC_COINS=$COINS}${VOLT:+ RLSC_VOL_TARGET=$VOLT}"
 SVC=rlsc-autotrade
 DASH=rlsc-dashboard
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -83,7 +86,7 @@ if [ "$M" = auto ]; then
 fi
 "$PY" -c "import sys; m=float(sys.argv[1]); assert 0<m<=0.05" "$M" || { echo "비율 $M 은 0 초과 0.05 이하"; exit 1; }
 PF=$(pf "$M"); grep -q "점검 통과" <<<"$PF" || { echo "$PF"; echo "비율 $M 로는 점검 실패 (최소 주문 미달 등) → 중단 (서비스 그대로)"; exit 1; }
-HASH=$(cd "$T" && "$PY" -c "import rls,sys; print(rls.config_hash(rls.strategy_config(tuple(int(x) for x in sys.argv[2].split(',')), insts=tuple(sys.argv[3].split(',')) if sys.argv[3] else rls.COINS, margin=float(sys.argv[1]))))" "$M" "$TR" "$COINS")
+HASH=$(cd "$T" && as_user $CENV RLSC_MARGIN="$M" MODE=dry "$PY" -c "import autotrade as A; print(A.rls.config_hash(A.CFG))" 2>/dev/null | tail -1)   # 봇과 같은 설정 (환경변수 포함)
 echo "== 적용 값: $CENV  RLSC_MARGIN=$M (종목당 $(awk "BEGIN{print $M*100}")%, 몫당 $(awk "BEGIN{printf \"%.3f\", $M*100/$NT}")%)  설정 해시 $HASH"
 ls "$HERE/reports/rlsc_runs" | grep -q "" && grep -l "\"strategy_hash\": \"$HASH\"" "$HERE"/reports/rlsc_runs/*/manifest.json 2>/dev/null | head -1 | xargs -r dirname | xargs -r basename | sed 's/^/   같은 설정 백테스트: /' || true
 

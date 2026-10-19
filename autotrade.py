@@ -3,7 +3,7 @@
 
 시각 분할 (기본 6몫, 환경변수 RLSC_TRANCHES): 자본을 몫 수로 나눠 몫마다 다른 일봉 경계(기본 UTC 00·04·08·12·16·20 = KST 09·13·17·21·01·05)로
   같은 규칙을 하루 1번 돌린다. RLSC_TRANCHES=0 이면 1몫 (UTC 00, 자본이 작아 여러 몫이 최소 주문에 못 미칠 때).
-  몫 구성을 바꾸면 열린 몫이 없을 때만 시작한다 (장부가 순번 #k 로 저장됨 → tranche_guard).
+  몫 구성을 바꾸면 장부를 같은 UTC 시각 몫으로 옮긴다. 새 구성에 없는 시각에 열린 몫이 있으면 시작하지 않는다 (tranche_guard).
   몫마다 장부·진입가·손절·본전·DROP1·edge 가 따로 있고, 거래소에서는 같은 상품·방향의 몫이 한 포지션으로 합쳐진다.
   손절은 몫마다 자기 수량만큼 따로 건다. 헤지 모드라 몫끼리 롱·숏이 달라도 상쇄되지 않는다.
 작업 (1 락 → 2 확정봉·신호 → 3 거래소 대사 → 4 위험 → 레짐 청산 → DROP1 → 진입 → 본전 → 5 주문 → 6 기록):
@@ -851,7 +851,10 @@ def job_tranche(ex, now, ctx, k):
                 ctx["notes"].append(f"{sym(inst)}#{k} 확정 일봉 공백 → 신호 갱신 없이 보유·손절만 유지")
             else:
                 sig = x.loc[sig_day]
-                regimes[tkey(inst, k)] = [int(sig.reg), int(sig.conf), float(sig.close), float(sig.atr)]   # 종가·ATR = 대시보드 손절·본전 구간
+                s50 = x.close.rolling(rls.SMA).mean()
+                regimes[tkey(inst, k)] = [int(sig.reg), int(sig.conf), float(sig.close), float(sig.atr),    # 종가·ATR = 대시보드 손절·본전 구간
+                                          float((sig.high - sig.low) / sig.atr),                          # 표시만: 신호 봉 폭/ATR · SMA50 20일 기울기 %
+                                          float(100 * (s50[sig_day] / s50.shift(rls.SLOPE)[sig_day] - 1))]   # (dashboard.market_state, 매매에 안 씀)
                 if s["side"]:
                     why = ("regime" if sig.conf != s["side"] else
                            "drop1" if rls.drop1(s["side"], sig.close, sig.prev, sig.atr) else None)
@@ -963,38 +966,52 @@ def preflight(ex):
             bad.append(f"{inst} 에 봇 포지션이 남아 있는데 RLSC_COINS 에서 빠짐 → 관리·손절 점검이 끊긴다. 청산 후 제외")
     prev, busy = tranche_busy()
     if busy:
-        bad.append(f"몫 구성 {prev} → {list(TRANCHES)} 변경인데 열린 몫·미확정 주문 {busy} → 청산 후 바꾼다 (장부가 순번으로 저장돼 다른 시각 봉으로 관리됨)")
+        bad.append(f"몫 구성 {prev} → {list(TRANCHES)} 변경인데 새 구성에 없는 시각의 열린 몫·미확정 주문 {busy} → 청산 후 바꾼다")
     elif prev is not None:
-        info.append(f"몫 구성 {prev} → {list(TRANCHES)} 변경: 시작 때 몫 장부 초기화 (열린 몫 없음)")
+        info.append(f"몫 구성 {prev} → {list(TRANCHES)} 변경: 시작 때 장부를 같은 UTC 시각 몫으로 옮김 (새 시각은 빈 장부)")
     return bad, info
 
 
 def tranche_busy():
-    """지난 실행(kv config)의 몫 구성과 지금 RLSC_TRANCHES 가 다르면 → (이전 구성, 열린 몫·미확정 주문). 같거나 처음이면 (None, [])."""
+    """지난 실행(kv config)의 몫 구성과 지금 RLSC_TRANCHES 가 다르면 → (이전 구성, 옮길 수 없는 열린 몫·미확정 주문). 같거나 처음이면 (None, []).
+    열린 몫은 새 구성에 같은 UTC 시각이 있으면 그 몫으로 옮겨지므로 막지 않는다 (tranche_guard). 없어지는 시각의 열린 몫만 막는다."""
     prev = (kv_get("config") or {}).get("strategy", {}).get("tranches_utc")
     if prev is None or list(prev) == list(TRANCHES):
         return None, []
-    ks = range(max(len(prev), N))
-    return prev, [tkey(i, k) for i in sorted(set(COINS) | set(rls.ALLOWED)) for k in ks if ledger(i, k).get("side")] + list(kv_get("pending", {}))
+    gone = [k for k, h in enumerate(prev) if h not in TRANCHES]
+    return prev, [tkey(i, k) for i in sorted(set(COINS) | set(rls.ALLOWED)) for k in gone if ledger(i, k).get("side")] + list(kv_get("pending", {}))
 
 
 def tranche_guard():
-    """몫 장부는 순번 #k 로 저장된다. 몫 구성이 바뀌면 같은 #k 가 다른 시각 봉으로 관리되므로
-    열린 몫·미확정 주문이 있으면 시작하지 않고, 없으면 몫 장부(edge·연패 포함)를 비워 새 구성으로 다시 복원한다."""
+    """몫 장부는 순번 #k 로 저장된다. 몫 구성이 바뀌면 장부를 UTC 시각 기준으로 옮긴다: 새 구성에 같은 시각이 있는 몫은
+    장부 전체(열린 포지션·손절 주문 ID·본전·edge·연패)를 그 몫 순번으로, 새로 생긴 시각은 빈 장부(edge 는 다음 몫 작업에서 과거 리플레이로 복원).
+    없어지는 시각에 열린 몫이 있거나 미확정 주문이 있으면 시작하지 않는다. 옮기기는 한 트랜잭션 (중간에 죽어도 장부가 반만 옮겨지지 않게)."""
     prev, busy = tranche_busy()
     if busy:
-        alert(f"몫 구성 {prev} → {list(TRANCHES)} 변경인데 열린 몫·미확정 주문 {busy} → 시작하지 않음. "
+        alert(f"몫 구성 {prev} → {list(TRANCHES)} 변경인데 새 구성에 없는 시각의 열린 몫·미확정 주문 {busy} → 시작하지 않음. "
               f"먼저 청산하거나 RLSC_TRANCHES={','.join(map(str, prev))} 로 되돌린다")
         sys.exit(0)                                           # 정상 종료 = systemd 가 재시작하지 않는다
-    if prev is not None:
-        for i in set(COINS) | set(rls.ALLOWED):
+    if prev is None:
+        return
+    to = {k: TRANCHES.index(h) for k, h in enumerate(prev) if h in TRANCHES}      # 옛 순번 → 새 순번 (같은 UTC 시각)
+    insts = sorted(set(COINS) | set(rls.ALLOWED))
+    old = {(i, k): kv_get(tkey(i, k)) for i in insts for k in range(len(prev))}
+    a, reg = kv_get("acct", {}), kv_get("regimes") or {}
+    a["streaks"] = {str(to[int(k)]): v for k, v in a.get("streaks", {}).items() if int(k) in to}
+    a["streak"] = max(a["streaks"].values(), default=0)
+    reg = {tkey(i, to[int(k)]): v for key, v in reg.items() for i, k in [key.split("#")] if k.isdigit() and int(k) in to}
+    with db() as c:
+        for i in insts:
             for k in range(max(len(prev), N)):
-                kv_set(tkey(i, k), None)
-        a = kv_get("acct", {})
-        a.pop("streaks", None), a.pop("streak", None)
-        kv_set("acct", a)
-        kv_set("config", effective_config())
-        log.info("몫 구성 %s → %s: 몫 장부 초기화 (edge 는 다음 몫 작업에서 과거 리플레이로 복원)", prev, list(TRANCHES))
+                c.execute("INSERT OR REPLACE INTO kv VALUES (?, ?)", (tkey(i, k), json.dumps(None)))
+            for k, j in to.items():
+                c.execute("INSERT OR REPLACE INTO kv VALUES (?, ?)", (tkey(i, j), json.dumps(old[(i, k)], default=str)))
+        for k, v in (("acct", a), ("regimes", reg), ("config", effective_config())):
+            c.execute("INSERT OR REPLACE INTO kv VALUES (?, ?)", (k, json.dumps(v, default=str)))
+    moved = [f"{tkey(i, k)}→#{to[k]}" for (i, k), s in old.items() if s and s.get("side") and k in to]
+    log.info("몫 구성 %s → %s: 장부를 UTC 시각대로 옮김 %s (새 시각은 빈 장부, edge 는 다음 몫 작업에서 복원)", prev, list(TRANCHES), moved)
+    if moved:
+        alert(f"몫 구성 {prev} → {list(TRANCHES)}: 열린 몫 {', '.join(moved)} 를 같은 UTC 시각 몫으로 옮김 (손절 주문 그대로)")
 
 
 # ---------- 실행 ----------

@@ -62,6 +62,19 @@ def perf(daily, trades, eq_now=None, day_eq=None):
             "realized": sum(t["pnl"] for t in done), "n": len(done), "win": sum(t["pnl"] > 0 for t in done) / len(done) if done else None}
 
 
+NARROW_SHOW, HOT_SHOW = 0.6, 6.0       # 표시만 (2026-10-19 사용자 결정: 매매 규칙 아님). 신호 봉 폭 < 0.6 ATR · SMA50 20일 기울기 > 6%
+
+
+def market_state(r, side):
+    """신호 봉 시장 상태 문구 (매매에 안 씀). r = regimes 기록 [reg, conf, close, atr, 폭/ATR, SMA50 기울기 %], side = 포지션·신호 방향 (0 이면 기울기 부호)."""
+    out = []
+    if len(r) > 4 and r[4] is not None and r[4] < NARROW_SHOW:
+        out.append(f"좁은 봉 (폭 {r[4]:.2f} ATR → 다음 날 크게 움직이기 쉬움)")
+    if len(r) > 5 and r[5] is not None and (side * r[5] if side else abs(r[5])) > HOT_SHOW:
+        out.append(f"과열 (SMA50 20일 기울기 {r[5]:+.1f}%)")
+    return " · ".join(out)
+
+
 def levels(ledger, regimes, meta, prices, eq):
     """몫마다 손절·본전 이동(이익 보호)·DROP1 기준·강제청산가. 보유 중이면 장부 값, 신호만 있으면 지금 가격에 진입할 때 예상값.
     고정 익절은 없다 — 이익은 본전 이동 뒤 추세가 꺾일 때(DROP1·레짐) 정리된다."""
@@ -107,7 +120,7 @@ def levels(ledger, regimes, meta, prices, eq):
         row["pnl_pct"] = side * (px / row["entry"] - 1) if px and s.get("side") else None
         row["drop1"] = close - side * rls.DROP_ATR * atr if close and atr else None
         out.append(row)
-    return out
+    return [x | {"market": market_state(regimes.get(x["key"]) or [], x["side"] or x["conf"])} for x in out]
 
 
 def rows(sql):
@@ -198,14 +211,15 @@ function drawPerf(p){
 function drawLevels(L){
   const el=document.getElementById('lv'),sm=t=>`<br><span style="font-size:12px;color:var(--t3)">${t}</span>`,nm=k=>k.replace('-USDT-SWAP','');
   el.innerHTML='<table><tr><th>몫 · 상태</th><th>방향</th><th>진입가</th><th>손절</th><th>본전 이동 (이익 보호)</th><th>DROP1 청산</th><th>강제청산</th></tr>'+
-    L.map(r=>!r.side?`<tr><td>${nm(r.key)}${sm(r.state)}</td><td>-</td><td>-${sm('현재 '+f(r.price,2))}</td><td colspan=4></td></tr>`:
-      `<tr><td>${nm(r.key)}${sm(r.state+(r.k?` · 크기 ×${r.k.toFixed(2)}`:'')+(r.below_min?' · <span class=f>최소 주문 미달</span>':''))}</td><td>${S[r.side]}</td>`+
+    L.map(r=>!r.side?`<tr><td>${nm(r.key)}${sm(r.state)}${r.market?sm('시장: '+r.market):''}</td><td>-</td><td>-${sm('현재 '+f(r.price,2))}</td><td colspan=4></td></tr>`:
+      `<tr><td>${nm(r.key)}${sm(r.state+(r.k?` · 크기 ×${r.k.toFixed(2)}`:'')+(r.below_min?' · <span class=f>최소 주문 미달</span>':''))}${r.market?sm('시장: '+r.market):''}</td><td>${S[r.side]}</td>`+
       `<td>${f(r.entry,2)}${sm('현재 '+f(r.price,2)+(r.pnl_pct==null?'':' · '+pc(r.pnl_pct)))}</td>`+
       `<td class=S>${f(r.stop,2)}${sm(sp(r.stop_pct)+(r.loss_at_stop==null?'':` · 손실 ${f(r.loss_at_stop,3)} USDT (${P(r.loss_at_stop_eq)})`))}</td>`+
       `<td class=g>${r.be_done?'완료':f(r.be_px,2)}${sm(r.be_done?'손절이 본전 위로 이동함':sp(r.be_pct)+' 도달 시 → 손절 '+f(r.be_stop,2))}</td>`+
       `<td>${r.drop1==null?'-':(r.side>0?'종가 ≤ ':'종가 ≥ ')+f(r.drop1,2)}${sm('다음 판단 시각 종가')}</td><td>${f(r.liq,2)}</td></tr>`).join('')+'</table>'+
     '<p style="font-size:12px;color:var(--t3);margin:8px 0 0">손절 = 거래소에 걸린 손절 (닿으면 즉시 청산) · 본전 이동 = 몫 판단 시각 종가가 이 가격을 넘으면 손절을 진입가 ±0.15% 로 옮겨 그 뒤로는 손실 없이 추세를 탐 · '+
-    'DROP1 = 다음 판단 시각 종가가 이 너머면 다음 시가에 청산 · "진입 예정"은 지금 가격에 들어갈 때의 예상값</p>';
+    'DROP1 = 다음 판단 시각 종가가 이 너머면 다음 시가에 청산 · "진입 예정"은 지금 가격에 들어갈 때의 예상값 · '+
+    '시장 = 신호 봉 상태 참고 표시 (좁은 봉 < 0.6 ATR, 과열 = 진입 방향 SMA50 20일 기울기 > 6%) — 매매 규칙에는 쓰지 않음</p>';
 }
 async function load(){
   const s=await (await fetch('/api/state')).json(),a=s.acct;

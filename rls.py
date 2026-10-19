@@ -45,6 +45,8 @@ BE_EDGE = False                        # C①: 본전 뒤 손절도 edge 를 걸
 ATR_MAX = 0.08                         # C②: 신호 봉 ATR14/종가 상한 (코인 진입). None = 없음 (C1)
 VOL_TARGET, VOL_K = 0.04, (0.5, 2.0)   # 2026-10-17 사용자 결정 동적 크기 (코인): 진입 증거금 × clip(4% / 신호 봉 ATR14/종가, 0.5, 2).
                                        # 변동성 클 때 작게, 작을 때 크게 (거래소 레버리지는 그대로). None = 끔. 연구: dynsize.py · riskprofile.py
+NARROW_W, NARROW_K = None, 0.5         # 연구용 좁은 신호 봉 크기 (고저 폭 < w × ATR14 → × 0.5). 운용 전략에는 없음 (None = 끔) —
+                                       # 2026-10-19 사용자 결정: 대시보드 시장 상태 표시만. 연구: reports/research_2026-10-19
 ADX_FILL, ADX_CONF = 30, 3             # C3 (2026-10-16 사용자 결정): 확정 레짐이 NEUTRAL 일 때 ADX14 > 30 인 DI 방향이 3일 연속이면 그 방향을
                                        # 레짐으로 쓴다 (코인만). ADX_FILL = None 이면 끈다 (C2). 연구: reports/research_2026-10-16/README.md
 SIM_MMR = {"coin": 0.004, "stock": 0.02}   # ponytail: 리플레이용 티어1 MMR 가정. 운용은 public/position-tiers 를 매일 조회
@@ -211,6 +213,12 @@ def vol_k(atr_v, close, target=None):
     return float(np.clip(target / (atr_v / close), *VOL_K)) if target else 1.0
 
 
+def narrow_k(range_atr, w=None):
+    """좁은 신호 봉 배수: (고가 − 저가) / ATR < w(기본 NARROW_W) 이면 NARROW_K, 아니면 1. w 가 None·0 이면 1."""
+    w = NARROW_W if w is None else w
+    return NARROW_K if w and range_atr < w else 1.0
+
+
 def vol_ok(atr_v, close, atr_max=ATR_MAX):
     """C②: 신호 봉 변동성이 손절폭에 비해 너무 크지 않을 때만 진입."""
     return not atr_max or atr_v / close <= atr_max
@@ -243,7 +251,7 @@ def m5(closes, members, listed, n=M5_N):
 def simulate(coins, stocks, members_at, listed, start, end=None, sleeves=("stock", "coin"), mmr=None,
              funding_8h=FUNDING_8H, slip=SLIP, kill=KILL_DD, daily_loss=DAILY_LOSS, entry_ok=None, tp_atr=None, trail_atr=None,
              fund_adverse=False, be_edge=BE_EDGE, atr_max=ATR_MAX, edge_days=None, edge_atr=None, retry_d1=0, risk=None,
-             max_total=MAX_TOTAL, size_k=None, vol_target=None, lever_fn=None):
+             max_total=MAX_TOTAL, size_k=None, vol_target=None, lever_fn=None, narrow_w=None):
     """한 계좌 일봉 리플레이 → (일별 자산 Series [UTC 00:00 기록], 거래 DataFrame, 일별 기록 DataFrame).
     coins: {instId: UTC 일봉}, stocks: {티커: 정규장 조정 일봉}, members_at(day) → NDX 구성종목 집합.
     하루 D: 00:00 자산 기록·일손실(직전 기록 대비 −5% → 코인 지금, 주식 다음 시가 청산·그 시각 진입 없음)·킬
@@ -260,7 +268,7 @@ def simulate(coins, stocks, members_at, listed, start, end=None, sleeves=("stock
     손절을 그동안의 최고가(숏은 최저가) ∓ trail_atr×ATR 로 올린다 (다음 봉부터, 후퇴 없음). 둘 다 연구용, 기본 없음.
     risk=r: 위험 기준 사이징 — 명목 = 실현 잔고 × r / 손절 거리 (손절에 닿으면 잔고 r 손실), 증거금 = 명목 / L. 기본 = 증거금 MARGIN 고정.
     max_total: 동시 증거금 합 상한 (전일 자산 비율).
-    vol_target: 동적 크기 목표 (기본 VOL_TARGET, 0 = 끔, 코인만).
+    vol_target: 동적 크기 목표 (기본 VOL_TARGET, 0 = 끔, 코인만). narrow_w: 연구용 좁은 신호 봉 기준 (기본 NARROW_W = 끔, 코인만).
     lever_fn(inst, 신호 봉 행) → 이 거래의 레버리지 (연구용 동적 레버리지, 기본 없음 = LEVER).
     size_k(inst, 신호 봉 행) → 배수: 진입 증거금(= 노출)에 곱한다 (연구용 동적 크기, 기본 없음 = 1).
     ponytail: 일봉 근사 — 주식 무기한 장외·주말 가격(기초 현물로 대체), 같은 날 코인 손절과 주식 체결의 선후는 모른다."""
@@ -311,7 +319,7 @@ def simulate(coins, stocks, members_at, listed, start, end=None, sleeves=("stock
         L = lever_fn(i, sig) if lever_fn else LEVER
         dist = stop_dist(sig.atr, sig.close, L, mmr[sleeve])
         margin = (cash * risk / dist / L if risk else cash * MARGIN) * (size_k(i, sig) if size_k else 1.0) \
-            * (vol_k(sig.atr, sig.close, vol_target) if sleeve == "coin" else 1.0)
+            * (vol_k(sig.atr, sig.close, vol_target) * narrow_k((sig.high - sig.low) / sig.atr, narrow_w) if sleeve == "coin" else 1.0)
         if sum(p["margin"] for p in pos.values()) + margin > cap + 1e-12:
             return 1
         fill, eq0 = o * (1 + side * slip), mark()
