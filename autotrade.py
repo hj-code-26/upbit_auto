@@ -62,7 +62,7 @@ TRANCHES = tuple(int(x) for x in os.environ.get("RLSC_TRANCHES", ",".join(map(st
 assert TRANCHES and all(0 <= h < 24 and h % 4 == 0 for h in TRANCHES), "몫 경계는 4H 봉 경계(0·4·…·20 시)"
 N = len(TRANCHES)                      # RLSC_TRANCHES=0 → 1몫 (자본이 작을 때), 기본 0,8,16 → 3몫
 COINS = tuple(os.environ.get("RLSC_COINS", ",".join(rls.COINS)).split(","))   # 운용 상품 (순서 = 진입 우선). 예: ETH-USDT-SWAP
-assert COINS and set(COINS) <= set(rls.COINS), f"RLSC_COINS 는 {rls.COINS} 중에서"
+assert COINS and set(COINS) <= set(rls.ALLOWED), f"RLSC_COINS 는 {rls.ALLOWED} 중에서"
 SEED_DAYS, COIN_WARMUP = 500, 150      # 시작 시 edge 복원용 / 신호 계산용 과거 일수
 RISK_POLL = float(os.environ.get("RLSC_RISK_POLL_SEC", 60 if MODE == "dry" else 5))   # 위험 감시 간격 (목표, API 제한 안에서)
 PROTECT_SEC = float(os.environ.get("RLSC_PROTECT_SEC", 60))   # 위험 감시 중 대사·손절 점검 간격
@@ -958,7 +958,7 @@ def preflight(ex):
             continue                                         # 봇이 연 포지션은 정상
         if ex.positions(inst) or ex.stops(inst):
             bad.append(f"{inst} 에 봇이 모르는 포지션/조건부 주문이 있음 → 정리 후 시작 (봇 장부와 어긋남)")
-    for inst in set(rls.COINS) - set(COINS):
+    for inst in set(rls.ALLOWED) - set(COINS):
         if any(s["side"] for s in books(inst).values()):
             bad.append(f"{inst} 에 봇 포지션이 남아 있는데 RLSC_COINS 에서 빠짐 → 관리·손절 점검이 끊긴다. 청산 후 제외")
     prev, busy = tranche_busy()
@@ -975,7 +975,7 @@ def tranche_busy():
     if prev is None or list(prev) == list(TRANCHES):
         return None, []
     ks = range(max(len(prev), N))
-    return prev, [tkey(i, k) for i in sorted(set(COINS) | set(rls.COINS)) for k in ks if ledger(i, k).get("side")] + list(kv_get("pending", {}))
+    return prev, [tkey(i, k) for i in sorted(set(COINS) | set(rls.ALLOWED)) for k in ks if ledger(i, k).get("side")] + list(kv_get("pending", {}))
 
 
 def tranche_guard():
@@ -987,7 +987,7 @@ def tranche_guard():
               f"먼저 청산하거나 RLSC_TRANCHES={','.join(map(str, prev))} 로 되돌린다")
         sys.exit(0)                                           # 정상 종료 = systemd 가 재시작하지 않는다
     if prev is not None:
-        for i in set(COINS) | set(rls.COINS):
+        for i in set(COINS) | set(rls.ALLOWED):
             for k in range(max(len(prev), N)):
                 kv_set(tkey(i, k), None)
         a = kv_get("acct", {})

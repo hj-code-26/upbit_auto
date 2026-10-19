@@ -706,6 +706,8 @@ def test_one_tranche_env():
     out = run("ETH-USDT-SWAP")
     assert out.stdout.split("\n")[-2] == "('ETH-USDT-SWAP',) ['ETH-USDT-SWAP']", out.stdout + out.stderr
     assert run("DOGE-USDT-SWAP").returncode != 0 and A.COINS == rls.COINS
+    out = run("ETH-USDT-SWAP,ZEC-USDT-SWAP")                  # ZEC 는 허용 목록에 있어 고를 수 있다 (기본값은 그대로 BTC·ETH)
+    assert out.stdout.split("\n")[-2] == "('ETH-USDT-SWAP', 'ZEC-USDT-SWAP') ['ETH-USDT-SWAP', 'ZEC-USDT-SWAP']", out.stdout + out.stderr
 
 
 def test_tranche_replay():

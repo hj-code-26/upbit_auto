@@ -336,7 +336,7 @@ def coin_validation(start=START, end=END):
 
 
 # ---------- 계좌 단위 리플레이 (운용과 같은 구조) ----------
-INST_META = {"BTC-USDT-SWAP": (0.01, 0.01, 0.01), "ETH-USDT-SWAP": (0.1, 0.01, 0.01)}   # ctVal, lotSz, minSz
+INST_META = {"BTC-USDT-SWAP": (0.01, 0.01, 0.01), "ETH-USDT-SWAP": (0.1, 0.01, 0.01), "ZEC-USDT-SWAP": (0.01, 1.0, 1.0)}   # ctVal, lotSz, minSz
 
 
 def account_replay(H, offs, start, end=None, margin=rls.MARGIN, lever_=rls.LEVER, capital=None, mmr=rls.SIM_MMR["coin"],

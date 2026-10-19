@@ -38,6 +38,7 @@ RISK_VER = "R2"                        # R1: 킬은 점검이 기록만, 청산�
 STOP_TRIGGER = "last"                  # 손절 발동 가격 종류 (리플레이 = 일봉 last 고저)
 M5_N, M5_EVERY, MOM_SKIP, MOM_LOOK, D200 = 5, 21, 21, 252, 200
 COINS = ("BTC-USDT-SWAP", "ETH-USDT-SWAP")
+ALLOWED = COINS + ("ZEC-USDT-SWAP",)    # RLSC_COINS 로 고를 수 있는 상품. ZEC: 2026-10-19 사용자 결정 (OKX 데이터 2025-11~, 검증 9개월뿐)
 TRANCHES = (0, 4, 8, 12, 16, 20)       # 시각 분할: 몫별 일봉 경계 (UTC 시). 몫당 증거금 = MARGIN / 몫 수. 2026-10-16 사용자 결정: 3몫 → 6몫
 EDGE_WHY = ("sl", "liq", "drop1")      # 이 사유로 정리되면 edge 재진입 제한
 BE_EDGE = False                        # C①: 본전 뒤 손절도 edge 를 걸까 (C1 = True)
