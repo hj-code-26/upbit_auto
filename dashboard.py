@@ -158,9 +158,9 @@ def api_state():
     shown = dict(regimes)                                     # 시장 표시용: 옛 봇 기록(4칸)이면 폭·기울기를 공개 봉으로 채운다
     for i in A.COINS:
         for k in range(A.N):
-            r = shown.get(A.tkey(i, k)) or []
-            if len(r) < 6 and (v := shape(i, A.TRANCHES[k])):
-                shown[A.tkey(i, k)] = (list(r) + [None] * 4)[:4] + list(v)
+            rec = shown.get(A.tkey(i, k)) or []               # r = 위험 상태 (아래에서 씀) 와 이름이 겹치지 않게
+            if len(rec) < 6 and (v := shape(i, A.TRANCHES[k])):
+                shown[A.tkey(i, k)] = (list(rec) + [None] * 4)[:4] + list(v)
     lv = levels(ledger, shown, acct.get("meta", {}), {i: price(i) for i in A.COINS}, eq)
     return {"mode": A.MODE, "schedule": SCHEDULE, "config": cfg, "backtest": backtest_for(cfg["strategy_hash"]),
             "risk": {**r, "label": STATE_TXT.get(r["state"], r["state"]),

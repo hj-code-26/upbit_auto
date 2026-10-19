@@ -185,6 +185,23 @@ def test_market_state():
     assert "과열" in D.market_state([0, 0, 1.0, 1.0, 0.9, -7.0], 0)
 
 
+def test_dashboard_api_state():
+    """/api/state 전체 응답 (시세·공개 봉은 가짜): 옛 봇 기록(4칸)이면 시장 표시를 공개 봉 값으로 채운다. 위험 상태는 dict 그대로."""
+    import dashboard as D
+    b = Bot()
+    old = D.price, D.shape
+    try:
+        D.price, D.shape = (lambda i: 100.0), (lambda i, off: (0.5, 7.0))
+        A.kv_set("regimes", {A.tkey(BTC, 0): [1, 1, 100.0, 2.0]})
+        s = D.api_state()
+        assert isinstance(s["risk"], dict) and s["risk"]["label"] and s["levels"]
+        assert "좁은 봉" in s["levels"][0]["market"] and "과열" in s["levels"][0]["market"], s["levels"][0]
+        assert s["regimes"][A.tkey(BTC, 0)] == [1, 1, 100.0, 2.0], "봇 기록은 그대로 (표시용 사본만 채움)"
+    finally:
+        D.price, D.shape = old
+        b.close()
+
+
 def test_edge_reentry():
     # 진입(봉 2) → 봉 3 손절 → BULL 유지 동안 재진입 없음 → 봉 5 NEUTRAL → 봉 6 BULL → 봉 7 재진입
     eq, t, _ = sim({BTC: frame(10, [1, 1, 1, 1, 1, 0, 1, 1, 0, 0], bars={3: (100, 100, 96, 99)})})
