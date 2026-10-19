@@ -49,10 +49,10 @@ def ts(x):
     return pd.Timestamp(x).tz_localize(None) if pd.Timestamp(x).tzinfo else pd.Timestamp(x)
 
 
-def min_capital(cfg, meta, price):
+def min_capital(cfg, meta, price, inst=None):
     """몫당 주문이 최소 수량 이상이 되는 실현 잔고 (autotrade.open_tranche 와 같은 식). meta = (ctVal, lotSz, minSz)."""
     ct, _, mn = meta
-    return mn * ct * price * (1 + SIZE_BUF) * len(cfg["tranches_utc"]) / (cfg["margin_per_symbol"] * cfg["lever"])
+    return mn * ct * price * (1 + SIZE_BUF) * len(cfg["tranches_utc"]) / (rls.margin_of(cfg, inst) * cfg["lever"])
 
 
 def first_entry(close, P, n):
@@ -121,7 +121,7 @@ def match(live, rep, since, eq_at, cfg, price):
             continue
         ct, lot, mn = B.INST_META[R["inst"]]
         eq = eq_at(ts(R["entry_ts"]))
-        sz = okx.floor_to(eq * cfg["margin_per_symbol"] / len(cfg["tranches_utc"]) * cfg["lever"] / (ct * price(R) * 1.001), lot) if eq else 0
+        sz = okx.floor_to(eq * rls.margin_of(cfg, R["inst"]) / len(cfg["tranches_utc"]) * cfg["lever"] / (ct * price(R) * 1.001), lot) if eq else 0
         out.append({"kind": "예상된 건너뜀 (최소 수량 미달)" if sz < mn else "리플레이만 진입", **R})
     return ok, out
 
@@ -137,7 +137,7 @@ def main():
     offs, N = tuple(cfg["tranches_utc"]), len(cfg["tranches_utc"])
     start = since.floor("D") - pd.Timedelta(days=WARM_DAYS)
     H = {i: B.confirmed(okx.Client().candles(i, int(start.timestamp() * 1000) - 3_600_000)) for i in cfg["insts"]}
-    e, t, cnt = B.account_replay(H, offs, start, margin=cfg["margin_per_symbol"], lever_=cfg["lever"])
+    e, t, cnt = B.account_replay(H, offs, start, margin=cfg.get("margin_by_inst") or cfg["margin_per_symbol"], lever_=cfg["lever"])
     o1 = {i: pd.Series(H[i].open.to_numpy(), index=pd.to_datetime(H[i].ts, unit="ms")) for i in H}
 
     daily = pd.Series({d: q for d, q in ro("SELECT date, equity FROM daily WHERE equity IS NOT NULL ORDER BY date")}, dtype=float)
@@ -190,7 +190,7 @@ def main():
         except Exception:  # noqa: BLE001
             meta = B.INST_META[i]
         px = float(H[i].close.iloc[-1])
-        need = min_capital(cfg, meta, px)
+        need = min_capital(cfg, meta, px, i)
         cap[i] = {"price": px, "need": round(need, 2), "realized": realized,
                   "headroom%": round((realized / need - 1) * 100, 1) if realized else None,
                   "price_max": round(px * realized / need) if realized else None}   # 이 가격을 넘으면 진입 불가

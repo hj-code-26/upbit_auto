@@ -135,6 +135,27 @@ def test_vol_sizing():
         b.close()
 
 
+def test_coin_weights():
+    """코인별 비중 (RLSC_WEIGHTS): 몫 증거금 = 실현 잔고 × 코인 비중 / 몫 수. 설정 해시에 들어가고, 없으면 RLSC_MARGIN 그대로."""
+    w = {BTC: 0.05, ETH: 0.025}
+    c0, c1 = rls.strategy_config(insts=(BTC, ETH)), rls.strategy_config(insts=(BTC, ETH), weights=w)
+    assert "margin_by_inst" not in c0 and c1["margin_by_inst"] == w and rls.config_hash(c0) != rls.config_hash(c1)
+    assert rls.margin_of(c1, BTC) == 0.05 and rls.margin_of(c0, BTC) == c0["margin_per_symbol"]
+    b = Bot()
+    old = A.WEIGHTS
+    try:
+        assert A.margin_for(BTC) == A.MARGIN, "비중 없으면 RLSC_MARGIN"
+        A.WEIGHTS = w
+        b.sig(0, 100, 1)
+        b.run("t0", 100)
+        mb, me = A.ledger(BTC, 0)["margin"], A.ledger(ETH, 0)["margin"]
+        assert abs(mb / me - 2) < 0.1, (mb, me)
+        assert abs(mb - 10_000 * 0.05 / A.N) / (10_000 * 0.05 / A.N) < 0.01, mb
+    finally:
+        A.WEIGHTS = old
+        b.close()
+
+
 def test_regime5_proto():
     """프로토타입 정세 1~5: 꾸준한 상승 = 5 → 롱, 레버리지는 청산가가 손절 바깥이 되게, 꾸준한 하락 = 2 이하."""
     import regime5 as R5
@@ -177,6 +198,26 @@ def test_dashboard_perf_levels():
     assert b["state"].startswith("재진입 제한") and b["side"] == 0
 
 
+def test_perf_flows():
+    """대시보드 수익률은 입출금 반영 (시간가중): 입금이 수익으로, 출금이 손실으로 보이지 않는다."""
+    import dashboard as D
+    daily = [{"date": "2026-10-01", "equity": 10.0}, {"date": "2026-10-02", "equity": 11.0}, {"date": "2026-10-03", "equity": 99.0}]
+    p = D.perf(daily, [], eq_now=99.0, flows=[["2026-10-02T15:00", 88.0]])          # 10 → 11 (+10%), 입금 88 → 99 (0%)
+    assert abs(p["total"] - 0.10) < 1e-12 and abs(p["today"]) < 1e-12 and p["net_flow"] == 88.0 and p["mdd"] == 0.0, p
+    p = D.perf(daily[:2], [], eq_now=5.5, flows=[["2026-10-02T15:00", -5.5]])       # 출금 절반 → 수익률 그대로
+    assert abs(p["total"] - 0.10) < 1e-12 and abs(p["today"]) < 1e-12, p
+
+
+def test_margin_use():
+    """대시보드 동시 증거금: 열린 몫 증거금 합 vs 한도(MAX_TOTAL × 일 기준), 코인별 합, 남은 자리 = 남은 한도 / 새 몫 증거금."""
+    import dashboard as D
+    led = {f"{ETH}#0": {"side": -1, "margin": 2.0}, f"{ETH}#1": {"side": 0}, f"{BTC}#0": {"side": 1, "margin": 1.0}}
+    m = D.margin_use(led, 100.0, 90.0)
+    slot = 90.0 * A.MARGIN / A.N
+    assert m["used"] == 3.0 and m["cap"] == rls.MAX_TOTAL * 100 and m["by_coin"] == {"ETH": 2.0, "BTC": 1.0} and m["open"] == 2
+    assert m["room"] == int((rls.MAX_TOTAL * 100 - 3.0) // slot) and D.margin_use(led, None, None)["room"] is None
+
+
 def test_market_state():
     """대시보드 시장 상태 (표시만): 좁은 봉 < 0.6 ATR · 진입 방향 SMA50 기울기 > 6%. 매매 크기는 바뀌지 않는다 (test_vol_sizing)."""
     import dashboard as D
@@ -194,7 +235,7 @@ def test_dashboard_api_state():
         D.price, D.shape = (lambda i: 100.0), (lambda i, off: (0.5, 7.0))
         A.kv_set("regimes", {A.tkey(BTC, 0): [1, 1, 100.0, 2.0]})
         s = D.api_state()
-        assert isinstance(s["risk"], dict) and s["risk"]["label"] and s["levels"]
+        assert isinstance(s["risk"], dict) and s["risk"]["label"] and s["levels"] and s["margin"]["cap_pct"] == rls.MAX_TOTAL
         assert "좁은 봉" in s["levels"][0]["market"] and "과열" in s["levels"][0]["market"], s["levels"][0]
         assert s["regimes"][A.tkey(BTC, 0)] == [1, 1, 100.0, 2.0], "봇 기록은 그대로 (표시용 사본만 채움)"
     finally:

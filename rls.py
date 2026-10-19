@@ -52,11 +52,13 @@ ADX_FILL, ADX_CONF = 30, 3             # C3 (2026-10-16 사용자 결정): 확�
 SIM_MMR = {"coin": 0.004, "stock": 0.02}   # ponytail: 리플레이용 티어1 MMR 가정. 운용은 public/position-tiers 를 매일 조회
 
 
-def strategy_config(tranches=TRANCHES, lever=LEVER, insts=COINS, margin=None):
-    """수익률 비교에 쓰는 전략 설정 (모드·인증 정보 없음). 운용·리플레이가 같은 dict 를 만든다. margin = 종목당 증거금 비율."""
+def strategy_config(tranches=TRANCHES, lever=LEVER, insts=COINS, margin=None, weights=None):
+    """수익률 비교에 쓰는 전략 설정 (모드·인증 정보 없음). 운용·리플레이가 같은 dict 를 만든다. margin = 종목당 증거금 비율.
+    weights = {instId: 종목당 증거금 비율} (코인별 비중, 2026-10-20 사용자 결정) — 있으면 margin_by_inst 로 들어가 해시가 달라진다."""
     n, margin = len(tranches), MARGIN if margin is None else margin
     return {"insts": list(insts), "tranches_utc": list(tranches), "lever": lever,
             "margin_per_symbol": margin, "margin_per_tranche": margin / n, "max_total_margin": MAX_TOTAL,
+            **({"margin_by_inst": {i: weights[i] for i in insts}} if weights else {}),
             "signal": {"ver": SIGNAL_VER, "sma": SMA, "slope": SLOPE, "conf": 3, "atr": f"wilder{ATR_N}", "sl_atr": SL_ATR,
                        "liq_buf": LIQ_BUF, "be_atr": BE_ATR, "be_off": BE_OFF, "drop_atr": DROP_ATR,
                        "edge_why": list(EDGE_WHY), "be_edge": BE_EDGE, "atr_max": ATR_MAX,
@@ -64,6 +66,11 @@ def strategy_config(tranches=TRANCHES, lever=LEVER, insts=COINS, margin=None):
             "risk": {"ver": RISK_VER, "kill_dd": KILL_DD, "daily_loss": DAILY_LOSS, "daily_ref": "UTC 00:00 record",
                      "streak_hold": STREAK_HOLD, "streak_scope": "tranche", "anomaly": ANOMALY, "stop_trigger": STOP_TRIGGER},
             "cost": {"taker": TAKER, "slip_one_way": SLIP, "funding_8h": FUNDING_8H, "funding_model": "constant, sign by side"}}
+
+
+def margin_of(cfg, inst):
+    """설정 dict 에서 상품의 종목당 증거금 비율 (코인별 비중이 있으면 그 값)."""
+    return cfg.get("margin_by_inst", {}).get(inst, cfg["margin_per_symbol"])
 
 
 def config_hash(cfg):
@@ -251,7 +258,7 @@ def m5(closes, members, listed, n=M5_N):
 def simulate(coins, stocks, members_at, listed, start, end=None, sleeves=("stock", "coin"), mmr=None,
              funding_8h=FUNDING_8H, slip=SLIP, kill=KILL_DD, daily_loss=DAILY_LOSS, entry_ok=None, tp_atr=None, trail_atr=None,
              fund_adverse=False, be_edge=BE_EDGE, atr_max=ATR_MAX, edge_days=None, edge_atr=None, retry_d1=0, risk=None,
-             max_total=MAX_TOTAL, size_k=None, vol_target=None, lever_fn=None, narrow_w=None):
+             max_total=MAX_TOTAL, size_k=None, vol_target=None, lever_fn=None, narrow_w=None, preempt=None):
     """한 계좌 일봉 리플레이 → (일별 자산 Series [UTC 00:00 기록], 거래 DataFrame, 일별 기록 DataFrame).
     coins: {instId: UTC 일봉}, stocks: {티커: 정규장 조정 일봉}, members_at(day) → NDX 구성종목 집합.
     하루 D: 00:00 자산 기록·일손실(직전 기록 대비 −5% → 코인 지금, 주식 다음 시가 청산·그 시각 진입 없음)·킬
@@ -270,6 +277,8 @@ def simulate(coins, stocks, members_at, listed, start, end=None, sleeves=("stock
     max_total: 동시 증거금 합 상한 (전일 자산 비율).
     vol_target: 동적 크기 목표 (기본 VOL_TARGET, 0 = 끔, 코인만). narrow_w: 연구용 좁은 신호 봉 기준 (기본 NARROW_W = 끔, 코인만).
     lever_fn(inst, 신호 봉 행) → 이 거래의 레버리지 (연구용 동적 레버리지, 기본 없음 = LEVER).
+    preempt=(순위 [instId, ...], 본전 뒤 보호): 동시 한도로 진입이 막히면 순위가 더 낮은 코인 포지션 중 가장 낮은 것을 그날 시가에 정리(why "preempt",
+    edge 없음)하고 다시 진입. 보호 = True 면 본전 이동한 포지션은 정리하지 않는다. 연구용, 기본 없음.
     size_k(inst, 신호 봉 행) → 배수: 진입 증거금(= 노출)에 곱한다 (연구용 동적 크기, 기본 없음 = 1).
     ponytail: 일봉 근사 — 주식 무기한 장외·주말 가격(기초 현물로 대체), 같은 날 코인 손절과 주식 체결의 선후는 모른다."""
     mmr = {**SIM_MMR, **(mmr or {})}
@@ -390,7 +399,15 @@ def simulate(coins, stocks, members_at, listed, start, end=None, sleeves=("stock
                 sig = x.loc[prv]
                 if sig.conf and sig.conf != blk.get(i) and not np.isnan(sig.atr) and vol_ok(sig.atr, sig.close, atr_max) \
                         and (entry_ok is None or entry_ok(i, prv)):
-                    blocked += enter(i, int(sig.conf), sig, o, "coin", D, cap)
+                    b = enter(i, int(sig.conf), sig, o, "coin", D, cap)
+                    if b and preempt and i in preempt[0]:          # 연구용: 낮은 순위 포지션을 정리하고 다시 진입
+                        low = [v for v in pos if v in preempt[0] and preempt[0].index(v) > preempt[0].index(i)
+                               and not (preempt[1] and pos[v]["be_ts"] is not None) and D in X[v].index]
+                        if low:
+                            v = max(low, key=preempt[0].index)
+                            close(v, X[v].at[D, "open"], "preempt", D)
+                            b = enter(i, int(sig.conf), sig, o, "coin", D, cap)
+                    blocked += b
 
         # 주식 시가 → 장중 손절 → 종가 판정
         if D in sess and S:

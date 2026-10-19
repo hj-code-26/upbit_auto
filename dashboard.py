@@ -34,7 +34,18 @@ def backtest_for(h, root=RUNS):
 _PX = {}
 
 
-_SHAPE = {}
+_SHAPE, _BAL = {}, [0.0, None]
+
+
+def balance():
+    """OKX 거래 계정 잔액 (조회만, 60초 캐시). 봇이 몫 작업 때 저장한 값은 입출금 직후 늦으므로 화면은 이 값을 먼저 쓴다. 실패하면 None."""
+    if time.time() - _BAL[0] > 60:
+        try:
+            v = A.okx_balance(A.make_client()) if A.MODE in ("demo", "live") else None
+        except Exception:  # noqa: BLE001  키 없음 등 → 봇이 저장한 값으로
+            v = None
+        _BAL[:] = [time.time(), v]
+    return _BAL[1]
 
 
 def shape(inst, off):
@@ -64,20 +75,47 @@ def price(inst):
     return p
 
 
-def perf(daily, trades, eq_now=None, day_eq=None):
-    """수익률 (입출금 미반영): 오늘(UTC 0시 기준)·7일·30일·시작 이후, 실현 손익·승률, 기록 기준 최대낙폭."""
+def perf(daily, trades, eq_now=None, day_eq=None, flows=()):
+    """수익률 (입출금 반영, 시간가중): 오늘(UTC 0시 기준)·7일·30일·시작 이후, 실현 손익·승률, 최대낙폭.
+    flows = 위험 감시가 기록한 [[시각, +입금/−출금], ...] (risk.flows). 기록 사이 수익률 = (자산 − 그 사이 순입금) / 직전 자산 − 1 을
+    이어 붙인 지수로 계산 → 입금이 수익으로, 출금이 손실로 보이지 않는다. day_eq = 위험 감시의 일 기준 (입출금 반영됨)."""
     e = A.pd.Series({A.pd.Timestamp(r["date"]): r["equity"] for r in daily if r.get("equity")}).sort_index()
     if e.empty:
         return None
     now = eq_now or e.iloc[-1]
+    fl = [(A.pd.Timestamp(t).tz_localize(None), float(v)) for t, v in flows]
+    net = lambda a, b: sum(v for t, v in fl if a < t <= b)  # noqa: E731
+    pts = list(e.items()) + [(A.pd.Timestamp.now("UTC").tz_localize(None), now)]
+    idx = [1.0]
+    for (t0, v0), (t1, v1) in zip(pts, pts[1:]):
+        idx.append(idx[-1] * ((v1 - net(t0, t1)) / v0 if v0 else 1.0))
+    x = A.pd.Series(idx, index=[t for t, _ in pts])
 
     def back(n):
-        s = e[e.index <= e.index[-1] - A.pd.Timedelta(days=n)]
-        return now / s.iloc[-1] - 1 if len(s) else None
+        s = x.iloc[:-1][x.index[:-1] <= e.index[-1] - A.pd.Timedelta(days=n)]
+        return x.iloc[-1] / s.iloc[-1] - 1 if len(s) else None
     done = [t for t in trades if t.get("pnl") is not None]
-    return {"equity": now, "start_eq": float(e.iloc[0]), "start_date": str(e.index[0].date()), "today": now / (day_eq or e.iloc[-1]) - 1,
-            "d7": back(7), "d30": back(30), "total": now / e.iloc[0] - 1, "mdd": float((1 - e / e.cummax()).max()),
+    return {"equity": now, "start_eq": float(e.iloc[0]), "start_date": str(e.index[0].date()),
+            "today": now / day_eq - 1 if day_eq else x.iloc[-1] / x.iloc[-2] - 1,
+            "d7": back(7), "d30": back(30), "total": x.iloc[-1] - 1, "mdd": float((1 - x / x.cummax()).max()),
+            "net_flow": sum(v for t, v in fl if t > e.index[0]),
             "realized": sum(t["pnl"] for t in done), "n": len(done), "win": sum(t["pnl"] > 0 for t in done) / len(done) if done else None}
+
+
+def margin_use(ledger, ref_eq, realized):
+    """동시 증거금 사용 vs 한도 (rls.MAX_TOTAL × 일 기준 자산, 운용 open_tranche 와 같은 기준).
+    남은 자리 = (한도 − 사용) / 새 몫 하나의 증거금 (실현 잔고 × 가장 큰 코인 비중 / 몫 수, 고정 크기 기준 — 동적 크기면 배수만큼 달라짐)."""
+    used = sum(s.get("margin", 0.0) for s in ledger.values() if s.get("side"))
+    by = {}
+    for key, s in ledger.items():
+        if s.get("side"):
+            c = key.split("-")[0]
+            by[c] = by.get(c, 0.0) + s.get("margin", 0.0)
+    cap = rls.MAX_TOTAL * ref_eq if ref_eq else None
+    slot = realized * max(A.margin_for(i) for i in A.COINS) / A.N if realized else None   # 가장 큰 비중 기준 (보수적)
+    return {"used": used, "cap": cap, "cap_pct": rls.MAX_TOTAL, "used_pct": used / ref_eq if ref_eq else None, "by_coin": by,
+            "open": sum(1 for s in ledger.values() if s.get("side")), "slots": len(ledger), "slot": slot,
+            "room": int(max(0.0, cap - used) // slot) if cap and slot else None}
 
 
 NARROW_SHOW, HOT_SHOW = 0.6, 6.0       # 표시만 (2026-10-19 사용자 결정: 매매 규칙 아님). 신호 봉 폭 < 0.6 ATR · SMA50 20일 기울기 > 6%
@@ -125,7 +163,7 @@ def levels(ledger, regimes, meta, prices, eq):
         else:
             side, entry, k = conf, px, rls.vol_k(atr, close)
             dist = rls.stop_dist(atr, close, L, mmr)
-            notional = eq * A.MARGIN / A.N * k * L if eq else None
+            notional = eq * A.margin_for(inst) / A.N * k * L if eq else None
             row |= {"state": "진입 예정 (예상값)", "side": side, "entry": entry,
                     "stop": rls.stop_px(side, entry, dist), "be_done": False, "be_px": entry + side * rls.BE_ATR * atr,
                     "liq": entry * (1 - side * rls.liq_dist(L, mmr)), "notional": notional, "k": k,
@@ -152,7 +190,7 @@ def api_state():
     cfg = A.kv_get("config") or A.effective_config()
     r = A.risk_get()
     daily, trades = rows("SELECT * FROM daily ORDER BY date"), rows("SELECT * FROM trades ORDER BY exit_ts DESC LIMIT 200")
-    ob, acct, regimes = A.kv_get("okx_balance"), A.kv_get("acct", {}), A.kv_get("regimes", {})
+    ob, acct, regimes = balance() or A.kv_get("okx_balance"), A.kv_get("acct", {}), A.kv_get("regimes", {})
     ledger = {A.tkey(i, k): A.ledger(i, k) for i in A.COINS for k in range(A.N)}
     eq = (ob or {}).get("eq") or (daily[-1]["equity"] if daily else None)
     shown = dict(regimes)                                     # 시장 표시용: 옛 봇 기록(4칸)이면 폭·기울기를 공개 봉으로 채운다
@@ -165,9 +203,10 @@ def api_state():
     return {"mode": A.MODE, "schedule": SCHEDULE, "config": cfg, "backtest": backtest_for(cfg["strategy_hash"]),
             "risk": {**r, "label": STATE_TXT.get(r["state"], r["state"]),
                      "entry_blocks": A.entry_blocks(r, A.dt.datetime.now(A.dt.UTC), A.kv_get("acct", {}))},
-            "daily": daily, "trades": trades, "perf": perf(daily, trades, eq, (r.get("day") or {}).get("eq")), "levels": lv,
+            "daily": daily, "trades": trades, "perf": perf(daily, trades, eq, (r.get("day") or {}).get("eq"), r.get("flows") or ()), "levels": lv,
             "orders": rows("SELECT * FROM orders ORDER BY ts DESC LIMIT 100"),
-            "acct": acct, "regimes": regimes, "okx": ob, "tranches": A.TRANCHES, "ledger": ledger, "forward": forward_json()}
+            "acct": acct, "regimes": regimes, "okx": ob, "tranches": A.TRANCHES, "ledger": ledger, "forward": forward_json(),
+            "margin": margin_use(ledger, (r.get("day") or {}).get("eq") or eq, (ob or {}).get("realized") or eq)}
 
 
 def forward_json():
@@ -192,7 +231,8 @@ td,th{padding:6px 8px;text-align:right;white-space:nowrap;border-bottom:1px soli
 .tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:10px}.tile{background:var(--bg);border-radius:12px;padding:12px}
 .tile b{display:block;font-size:20px;margin-top:4px}.tile span{font-size:12px;color:var(--t3)}
 </style><div class=wrap><h1>RLS-C v1 <span id=mode style="font-size:14px;color:var(--t3)"></span></h1>
-<div class=card><h2>수익률 <span style="font-size:13px;color:var(--t3);font-weight:400">입출금 미반영 · 일별 기록 기준</span></h2><div id=perf class=tiles></div></div>
+<div class=card><h2>수익률 <span style="font-size:13px;color:var(--t3);font-weight:400">입출금 반영 (시간가중) · 일별 기록 + 지금 잔액</span></h2><div id=perf class=tiles></div></div>
+<div class=card><h2>동시 증거금 한도 <span style="font-size:13px;color:var(--t3);font-weight:400">열린 몫 증거금 합 ≤ 일 기준 자산 × 한도 — 넘으면 RLSC_COINS 순서 뒤 코인부터 진입 건너뜀</span></h2><div id=mg class=tiles></div></div>
 <div class=card><h2>손절 · 이익 보호 구간 <span style="font-size:13px;color:var(--t3);font-weight:400">고정 익절 없음 — 본전 이동 뒤 추세가 꺾일 때(DROP1·레짐) 청산</span></h2><div id=lv></div></div>
 <div class=card id=now></div><div class=card><h2>가격 범위와 진입 기준 <span style="font-size:13px;color:var(--t3);font-weight:400">예측 아님 · 최근 60일 변동성이 이어진다고 볼 때의 범위</span></h2><canvas id=ol height=110></canvas><div id=olt style="margin-top:12px"></div></div><div class=card><h2>자산 vs 같은 기간 기준선 (시작 대비 %)</h2><canvas id=chart height=90></canvas></div>
 <div class=card><h2>거래</h2><table id=trades></table></div><div class=card><h2>일별 기록</h2><table id=daily></table></div><div class=card><h2>주문</h2><table id=orders></table></div></div>
@@ -229,7 +269,16 @@ function drawPerf(p){
   if(!p){el.textContent='기록 없음';return}
   const T=[['현재 자산',f(p.equity,4)+' USDT'],['오늘 (UTC 0시 대비)',pc(p.today)],['7일',pc(p.d7)],['30일',pc(p.d30)],
     [`시작 이후 (${p.start_date}, ${f(p.start_eq,2)})`,pc(p.total)],['실현 손익',`${p.realized>0?'+':''}${f(p.realized,4)} USDT`],
-    ['거래 · 승률',`${p.n}건 · ${p.win==null?'-':(p.win*100).toFixed(0)+'%'}`],['최대낙폭 (기록 기준)',P(-p.mdd)]];
+    ['거래 · 승률',`${p.n}건 · ${p.win==null?'-':(p.win*100).toFixed(0)+'%'}`],['최대낙폭 (기록 기준)',P(-p.mdd)],
+    ['순입금 (시작 이후)',`${p.net_flow>0?'+':''}${f(p.net_flow||0,2)} USDT`]];
+  el.innerHTML=T.map(([k,v])=>`<div class=tile><span>${k}</span><b>${v}</b></div>`).join('');
+}
+function drawMargin(m){
+  const el=document.getElementById('mg');
+  if(!m||m.cap==null){el.textContent='기록 없음';return}
+  const T=[['사용 / 한도',`${f(m.used,3)} / ${f(m.cap,3)} USDT`],['사용률',`${P(m.used_pct)} / ${P(m.cap_pct)}`],
+    ['열린 몫',`${m.open} / ${m.slots}`],['남은 자리 (새 몫)',m.room==null?'-':`${m.room}몫 · 몫당 ${f(m.slot,3)} USDT`],
+    ...Object.entries(m.by_coin).map(([c,v])=>[`${c} 증거금`,`${f(v,3)} USDT`])];
   el.innerHTML=T.map(([k,v])=>`<div class=tile><span>${k}</span><b>${v}</b></div>`).join('');
 }
 function drawLevels(L){
@@ -268,7 +317,7 @@ async function load(){
   const K=[['equity','계좌',r=>(r.equity/e0-1)*100],['stock_only','주식만',r=>r.stock_only*100],['coin_only','코인만',r=>r.coin_only*100],['btc_hold','BTC 1x',r=>r.btc_hold*100]];
   const data={labels:d.map(r=>r.date),datasets:K.map(([k,n,g],j)=>({label:n,data:d.map(r=>r[k]==null?null:g(r)),borderColor:C[j],pointRadius:0,borderWidth:2}))};
   if(chart){chart.data=data;chart.update()}else chart=new Chart(document.getElementById('chart'),{type:'line',data,options:{animation:false,spanGaps:true}});
-  drawOutlook(s.forward,s.levels);drawPerf(s.perf);drawLevels(s.levels||[]);
+  drawOutlook(s.forward,s.levels);drawPerf(s.perf);drawMargin(s.margin);drawLevels(s.levels||[]);
 }
 load();setInterval(load,60000);
 </script></html>"""

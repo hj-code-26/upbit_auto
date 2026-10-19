@@ -226,11 +226,14 @@ def lever(L, margin=None):
         rls.LEVER, rls.MARGIN = old
 
 
-def coin_run(name, H, offs, L, start, end, cost=None, extra=None, margin=0.02, **kw):
-    """한 구성 리플레이 → reports/rlsc_runs/<name>/ 에 manifest·equity·trades·rolling 저장 → 요약 dict."""
+def coin_run(name, H, offs, L, start, end, cost=None, extra=None, margin=0.02, weights=None, **kw):
+    """한 구성 리플레이 → reports/rlsc_runs/<name>/ 에 manifest·equity·trades·rolling 저장 → 요약 dict.
+    weights = {instId: 종목당 증거금} (코인별 비중, 운용 RLSC_WEIGHTS 와 같은 해시)."""
     with lever(L, margin):
+        if weights:
+            kw["size_k"] = lambda i, s: weights[i] / rls.MARGIN  # noqa: E731
         eq, tr = rls.simulate_tranches(H, offs, start, end, **kw)
-        cfg = rls.strategy_config(offs, L, insts=tuple(H))
+        cfg = rls.strategy_config(offs, L, insts=tuple(H), weights=weights)
         cap = rls.liq_dist(L, rls.SIM_MMR["coin"]) - rls.LIQ_BUF
         exposure = {"margin_per_symbol": rls.MARGIN, "margin_per_tranche": rls.MARGIN / len(offs),
                     "notional_per_symbol_full": rls.MARGIN * L, "notional_gross_full_2coins": 2 * rls.MARGIN * L}
@@ -423,7 +426,7 @@ def account_replay(H, offs, start, end=None, margin=rls.MARGIN, lever_=rls.LEVER
                 p = pos.get(key)
                 if not p and sig.conf and sig.conf != blk.get(key) and rls.vol_ok(sig.atr, sig.close) \
                         and not halted and not hold and dl_day != t.date():
-                    m_amt = cash * margin / N
+                    m_amt = cash * (margin[i] if isinstance(margin, dict) else margin) / N   # dict = 코인별 비중
                     if sum(q["margin"] for q in pos.values()) + m_amt > rls.MAX_TOTAL * day_ref + 1e-12:
                         cnt["cap_block"] += 1
                         continue

@@ -7,6 +7,9 @@
 #            sudo env RLSC_TRANCHES=0,8,16 RLSC_COINS=ETH-USDT-SWAP bash rlsc_r2_deploy.sh 0.04   # 소액(≈7 USDT): ETH 만 3몫, 종목당 4%
 #            sudo env RLSC_TRANCHES=0,4,8,12,16,20 RLSC_COINS=BTC-USDT-SWAP,ETH-USDT-SWAP,ZEC-USDT-SWAP RLSC_VOL_TARGET=0 bash rlsc_r2_deploy.sh 0.04
 #                                                   # 2026-10-19: BTC+ETH+ZEC 6몫 4% 고정 크기 (3몫 00·08·16 열린 몫은 #0·#2·#4 로 옮김, 실현 잔고 ≥ 약 60 USDT)
+#            sudo env RLSC_TRANCHES=0,4,8,12,16,20 RLSC_COINS=ETH-USDT-SWAP,ZEC-USDT-SWAP,BTC-USDT-SWAP RLSC_VOL_TARGET=0 \
+#                 RLSC_WEIGHTS=ETH-USDT-SWAP=0.05,ZEC-USDT-SWAP=0.04,BTC-USDT-SWAP=0.03 bash rlsc_r2_deploy.sh 0.04
+#                                                   # 2026-10-20: 순서 ETH→ZEC→BTC, 코인별 비중 5/4/3 (해시 6a81786656c7)
 # 순서: 서비스 정보 확인 → 새 코드 테스트(임시 폴더) → 백업 → 새 코드로 조회만 하는 점검(--preflight, 임시 폴더·DB 사본)
 #       → 비율 결정 → HH:15~HH:55 까지 대기 → 정지 → 교체 → systemd drop-in → 시작 → 확인 (실패하면 자동 롤백).
 # 주문·청산·계좌 설정 변경은 하지 않는다. 열린 포지션의 손절은 거래소에 남아 있다 (정지 시간 동안 위험 감시는 없음).
@@ -14,9 +17,10 @@ set -euo pipefail
 TR=${RLSC_TRANCHES:-0,4,8,12,16,20}    # 몫 경계 (UTC 시)
 COINS=${RLSC_COINS:-}                  # 비우면 BTC·ETH. 예: ETH-USDT-SWAP
 VOLT=${RLSC_VOL_TARGET:-}              # 비우면 코드 기본 (동적 크기 4%). 0 = 고정 크기
+WTS=${RLSC_WEIGHTS:-}                  # 코인별 종목당 증거금. 예: ETH-USDT-SWAP=0.05,ZEC-USDT-SWAP=0.04,BTC-USDT-SWAP=0.03 (비우면 RLSC_MARGIN 하나)
 NT=$(awk -F, '{print NF}' <<<"$TR")
 FIRST=$(cut -d- -f1 <<<"${COINS:-BTC}")  # 자동 비율을 맞출 종목 (첫 종목)
-CENV="RLSC_TRANCHES=$TR${COINS:+ RLSC_COINS=$COINS}${VOLT:+ RLSC_VOL_TARGET=$VOLT}"
+CENV="RLSC_TRANCHES=$TR${COINS:+ RLSC_COINS=$COINS}${VOLT:+ RLSC_VOL_TARGET=$VOLT}${WTS:+ RLSC_WEIGHTS=$WTS}"
 SVC=rlsc-autotrade
 DASH=rlsc-dashboard
 HERE=$(cd "$(dirname "$0")" && pwd)

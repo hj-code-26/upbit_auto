@@ -14,7 +14,7 @@
   risk  RLSC_RISK_POLL_SEC(기본 5초, dry 60초)마다  위험 감시: 자산·입출금 조회 → 일 기준(UTC 00:00 직후 첫 기록)·고점·킬
         → 청산 사유가 있으면 그 자리에서 계좌 단위 비상 청산 (RUNNING → HALTING → FLATTENING → HALTED, 실패 = DEGRADED)
         RLSC_PROTECT_SEC(기본 60초)마다 guard 와 같은 대사·손절 점검.
-위험(R2): 몫당 증거금 = 실현 잔고 × RLSC_MARGIN(기본 4%) / 몫 수, 동시 합 ≤ 일 기준 자산 10%. 일 기준 대비 −5% (UTC 날 경계 판정) → 전 몫 즉시 청산,
+위험(R2): 몫당 증거금 = 실현 잔고 × RLSC_MARGIN(기본 4%, RLSC_WEIGHTS 가 있으면 코인별) / 몫 수, 동시 합 ≤ 일 기준 자산 10%. 일 기준 대비 −5% (UTC 날 경계 판정) → 전 몫 즉시 청산,
       그 UTC 날 진입 없음. 킬: 일별 고점 대비 −35% (상시 판정) → 즉시 전량 청산·정지. 강제청산 1건·몫별 20연패 → 진입 중단.
       거래 손실 > 자산 3% 경보. 조회 실패·수량 불일치·미보호 몫·봇 외 주문·미확정 주문 → 신규 진입 차단 (자동 해제).
       입출금(거래 계정 이체)은 일 기준·고점을 같은 금액만큼 옮긴다 (입금 = 수익, 출금 = 손실로 보지 않음).
@@ -73,7 +73,16 @@ SIZE_BUF = 0.001                       # 수량 산정 가격 여유 10bp: 시�
 MARGIN = float(os.environ.get("RLSC_MARGIN", rls.MARGIN))   # 종목당 증거금 비율 (실현 잔고 대비). 몫당 = MARGIN / N
 assert 0 < MARGIN and 2 * MARGIN <= rls.MAX_TOTAL + 1e-12, f"RLSC_MARGIN={MARGIN}: 0 초과, 두 종목 합이 동시 한도 {rls.MAX_TOTAL:.0%} 이하(≤ 5%)"
 rls.VOL_TARGET = float(os.environ.get("RLSC_VOL_TARGET", rls.VOL_TARGET or 0)) or None   # 동적 크기 목표 (0 = 끔: BTC+ETH 다몫은 끄는 편이 낫다)
-CFG = rls.strategy_config(TRANCHES, rls.LEVER, insts=COINS, margin=MARGIN)
+WEIGHTS = {k: float(v) for k, v in (x.split("=") for x in os.environ.get("RLSC_WEIGHTS", "").split(",") if x)}   # 코인별 종목당 증거금
+assert not WEIGHTS or (set(WEIGHTS) == set(COINS) and all(0 < w <= 0.05 for w in WEIGHTS.values())
+                       and sum(sorted(WEIGHTS.values())[-2:]) <= rls.MAX_TOTAL + 1e-12), \
+    f"RLSC_WEIGHTS={WEIGHTS}: RLSC_COINS 전부, 각 0 초과 5% 이하, 큰 두 종목 합 ≤ 동시 한도 {rls.MAX_TOTAL:.0%} (예: ETH-USDT-SWAP=0.05,ZEC-USDT-SWAP=0.04,BTC-USDT-SWAP=0.03)"
+CFG = rls.strategy_config(TRANCHES, rls.LEVER, insts=COINS, margin=MARGIN, weights=WEIGHTS or None)
+
+
+def margin_for(inst):
+    """상품의 종목당 증거금 비율: RLSC_WEIGHTS 가 있으면 코인별, 없으면 RLSC_MARGIN."""
+    return WEIGHTS.get(inst, MARGIN)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s",
                     handlers=[logging.StreamHandler(sys.stdout),
@@ -154,7 +163,8 @@ def effective_config():
     """비밀정보 없는 유효 설정. strategy = 리플레이와 같은 전략 설정 (해시 비교 대상). 거래소 적용값은 조회 전까지 unverified."""
     return {"mode": MODE, "strategy": CFG, "strategy_hash": rls.config_hash(CFG), "code": code_version(),
             "source": {"RLSC_TRANCHES": "env" if "RLSC_TRANCHES" in os.environ else "default",
-                       "RLSC_MARGIN": "env" if "RLSC_MARGIN" in os.environ else "default", "MODE": "env" if "MODE" in os.environ else "default"},
+                       "RLSC_MARGIN": "env" if "RLSC_MARGIN" in os.environ else "default",
+                       "RLSC_WEIGHTS": "env" if "RLSC_WEIGHTS" in os.environ else "default", "MODE": "env" if "MODE" in os.environ else "default"},
             "runtime": {"risk_poll_sec": RISK_POLL, "protect_sec": PROTECT_SEC, "lever_applied": "min(lever, exchange max) — 거래소 조회값은 leverage-info"}}
 
 
@@ -694,7 +704,7 @@ def open_tranche(ex, inst, B, k, side, sig, key, ctx):
     m = meta(ex, inst, a)
     L, last = m["L"], ex.ticker(inst)["last"]
     vk = rls.vol_k(sig.atr, sig.close)                       # 동적 크기: 변동성 클 때 작게 (rls.VOL_TARGET)
-    margin = ctx["realized"] * MARGIN / N * vk               # 종목당 비율을 몫 수로 나눈다 (몫마다 다시 쓰지 않음)
+    margin = ctx["realized"] * margin_for(inst) / N * vk     # 종목당 비율(코인별 비중)을 몫 수로 나눈다 (몫마다 다시 쓰지 않음)
     sz = okx.floor_to(margin * L / (m["ctVal"] * last * (1 + SIZE_BUF)), m["lotSz"])   # 체결 슬리피지로 2%/N 을 넘지 않게
     dist = rls.stop_dist(sig.atr, sig.close, L, m["mmr"])
     if ctx["used"] + margin > rls.MAX_TOTAL * ctx["ref_eq"] + 1e-9:
@@ -707,7 +717,7 @@ def open_tranche(ex, inst, B, k, side, sig, key, ctx):
         return False
     why = ("레버리지 > 거래소 최대" if L > m["lever"] else
            "손절 거리 ≤ 0 (청산 거리 부족)" if dist <= 0 else
-           f"증거금 > 실현 잔고 {MARGIN:.2%}/{N}×{vk:.2f}" if sz * m["ctVal"] * last / L > margin + 1e-9 else
+           f"증거금 > 실현 잔고 {margin_for(inst):.2%}/{N}×{vk:.2f}" if sz * m["ctVal"] * last / L > margin + 1e-9 else
            "가용 증거금 부족" if margin > ctx["avail"] else None)
     if not why:
         ex.set_leverage(inst, L, side)
@@ -927,7 +937,7 @@ def min_capital(ex):
     out = {}
     for inst in COINS:
         m = ex.instrument(inst)
-        out[inst] = m["minSz"] * m["ctVal"] * ex.ticker(inst)["last"] / (MARGIN / N * rls.lever_for(m["lever"]))
+        out[inst] = m["minSz"] * m["ctVal"] * ex.ticker(inst)["last"] / (margin_for(inst) / N * rls.lever_for(m["lever"]))
     return out
 
 
@@ -949,7 +959,7 @@ def preflight(ex):
     need = min_capital(ex)
     for inst, v in need.items():
         info.append(f"{sym(inst)} 최소 주문에 필요한 실현 잔고 ≈ {v:.1f} USDT ({'충족' if realized >= v else '부족 → 이 상품은 건너뜀'}) · "
-                    f"지금 잔고로 최소 주문을 맞추는 종목당 증거금 ≈ {MARGIN * v / realized * (1 + SIZE_BUF):.2%} (현재 {MARGIN:.2%})"
+                    f"지금 잔고로 최소 주문을 맞추는 종목당 증거금 ≈ {margin_for(inst) * v / realized * (1 + SIZE_BUF):.2%} (현재 {margin_for(inst):.2%})"
                     if realized > 0 else f"{sym(inst)} 실현 잔고 0")
     if realized < min(need.values()):
         bad.append(f"실현 잔고 {realized:.2f} USDT < 최소 {min(need.values()):.1f} USDT → 어떤 주문도 최소 단위 미달")
