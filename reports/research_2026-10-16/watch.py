@@ -28,14 +28,16 @@ def signals(h):
         rows.append(x[["t", "conf", "atr", "close", "prev", "w", "age", "slope", "adx"]])
     return pd.concat(rows).set_index("t").sort_index()
 
-def run(h, hours, start, end, L=30, margin=0.04, limit=None, S=None, be_r=None, be_to=0.0, narrow=False, chase=None):
+def run(h, hours, start, end, L=30, margin=0.04, limit=None, S=None, be_r=None, be_to=0.0, narrow=False, chase=None, tp_range=None):
     """limit=(x, W, fallback): 판단 시각에 시장가 대신 지정가 (숏은 시가 + x×ATR 위, 롱은 아래). W 시간 안에 닿으면 그 가격 체결(maker),
     못 닿으면 fallback=True 면 W 시간 뒤 시가에 시장가, False 면 그 진입은 건너뛴다. 체결 봉에서 손절가까지 닿았으면 손절로 본다(보수적).
     be_r=k: 1H 봉 고(롱)/저(숏)가 진입가 + k×손절 거리(= +kR) 에 닿으면 다음 봉부터 손절을 진입가 + be_to×손절 거리 (0 = 본전 + BE_OFF)로 올린다.
     narrow: 좁은 신호 봉 배수 (rls.narrow_k) 도 크기에 곱한다 (지금 운용 규칙).
     chase=(mode, n, W): 손절(본전 손절 제외) 뒤 그 몫 경계의 최신 일봉 신호가 아직 같은 방향이면 재진입 (edge 대신). 최대 n 번 연속, W 시간 안.
       mode "now" = 다음 시간 시가 즉시, "reclaim" = 1H 종가가 손절가를 다시 넘은(롱: 위로) 다음 시간 시가. 신호가 꺼지면 추격 취소.
-      (mode, n, W, opt) opt: k = 추격 진입 크기 배수, age = 재진입 신호의 레짐 나이 상한(일), adx = ADX14 하한, slope = 진입 방향 SMA50 기울기 상한(%)."""
+      (mode, n, W, opt) opt: k = 추격 진입 크기 배수, age = 재진입 신호의 레짐 나이 상한(일), adx = ADX14 하한, slope = 진입 방향 SMA50 기울기 상한(%).
+    tp_range=(kR, n_max, offs): 자기 경계 종가 판정 때 미실현 ≥ kR 이고 다른 몫 경계(offs) 중 같은 방향 신호가 n_max 개 이하면
+      (몫끼리 신호가 엇갈림 = 추세 약화·횡보) 다음 시가에 익절, 같은 방향 재진입은 신호가 꺼졌다 켜져야 (edge)."""
     b = h.assign(t=pd.to_datetime(h.ts, unit="ms")).set_index("t")[["open", "high", "low", "close"]].astype(float)
     b = b[(b.index >= pd.Timestamp(start)) & (b.index <= pd.Timestamp(end))]
     S = signals(h) if S is None else S
@@ -59,6 +61,16 @@ def run(h, hours, start, end, L=30, margin=0.04, limit=None, S=None, be_r=None, 
 
     def ok_q(s2, side):                                                # 추격 품질 조건 (opt)
         return (s2.age <= opt.get("age", 1e9) and s2.adx >= opt.get("adx", -1) and side * s2.slope <= opt.get("slope", 1e9))
+
+    def agree(at, h0, side, offs):                                   # 다른 몫 경계의 최신 일봉 신호 중 side 와 같은 수
+        n = 0
+        for h in offs:
+            if h == h0:
+                continue
+            tb = at.normalize() + pd.Timedelta(hours=h)
+            tb = tb if tb <= at else tb - pd.Timedelta(days=1)
+            n += int(tb in S.index and S.at[tb, "conf"] == side)
+        return n
 
     n_ch = 0
     for t, r in b.iterrows():
@@ -123,6 +135,9 @@ def run(h, hours, start, end, L=30, margin=0.04, limit=None, S=None, be_r=None, 
                 s2 = S.loc[nxt]
                 if rls.drop1(pos["side"], s2.close, s2.prev, s2.atr):
                     pend = "drop1"; blk = pos["side"]
+                elif tp_range and pos["side"] * (s2.close / pos["entry"] - 1) / pos["dist"] >= tp_range[0] and \
+                        agree(nxt, pos["h0"], pos["side"], tp_range[2]) <= tp_range[1]:
+                    pend = "tp_range"; blk = pos["side"]
                 elif not pos["be"] and rls.be_hit(pos["side"], s2.close, pos["entry"], pos["atr_e"]):
                     pos["stop"] = rls.tighten(pos["side"], pos["stop"], rls.be_px(pos["side"], pos["entry"])); pos["be"] = True
         if ch is not None and not ch["ok"] and ch["side"] * (r.close - ch["stop"]) > 0:
