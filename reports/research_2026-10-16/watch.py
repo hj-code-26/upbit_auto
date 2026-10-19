@@ -7,35 +7,60 @@ HERE = pathlib.Path(__file__).resolve().parent; sys.path[:0] = [str(HERE.parents
 import numpy as np, pandas as pd, rls, backtest as bt
 from multiprocessing import Pool
 
+def adx14(x):
+    up, dn = x.high.diff(), -x.low.diff()
+    pdm, ndm = up.where((up > dn) & (up > 0), 0.0), dn.where((dn > up) & (dn > 0), 0.0)
+    pc = x.close.shift(); tr = pd.concat([x.high - x.low, (x.high - pc).abs(), (x.low - pc).abs()], axis=1).max(axis=1)
+    w = lambda s: s.ewm(alpha=1 / rls.ATR_N, adjust=False, min_periods=rls.ATR_N).mean()  # noqa: E731
+    pdi, ndi = w(pdm) / w(tr), w(ndm) / w(tr)
+    return w(100 * (pdi - ndi).abs() / (pdi + ndi))
+
+
 def signals(h):
     """시각 t → (그 시각 경계 24h 봉이 막 끝났을 때의 conf, atr, close, prev) — 24개 경계 모두."""
     rows = []
     for off in range(24):
         x = rls.prep(rls.offset_daily(h, off, 1))
         x = x.assign(t=x.index + pd.Timedelta(hours=24))           # 봉이 끝나는 시각
-        rows.append(x[["t", "conf", "atr", "close", "prev"]])
+        s50 = x.close.rolling(rls.SMA).mean(); run_ = (x.conf != x.conf.shift()).cumsum()
+        x = x.assign(w=(x.high - x.low) / x.atr, age=x.groupby(run_).cumcount() + 1, slope=100 * (s50 / s50.shift(rls.SLOPE) - 1),
+                     adx=adx14(x))
+        rows.append(x[["t", "conf", "atr", "close", "prev", "w", "age", "slope", "adx"]])
     return pd.concat(rows).set_index("t").sort_index()
 
-def run(h, hours, start, end, L=30, margin=0.04, limit=None, S=None):
+def run(h, hours, start, end, L=30, margin=0.04, limit=None, S=None, be_r=None, be_to=0.0, narrow=False, chase=None):
     """limit=(x, W, fallback): 판단 시각에 시장가 대신 지정가 (숏은 시가 + x×ATR 위, 롱은 아래). W 시간 안에 닿으면 그 가격 체결(maker),
-    못 닿으면 fallback=True 면 W 시간 뒤 시가에 시장가, False 면 그 진입은 건너뛴다. 체결 봉에서 손절가까지 닿았으면 손절로 본다(보수적)."""
+    못 닿으면 fallback=True 면 W 시간 뒤 시가에 시장가, False 면 그 진입은 건너뛴다. 체결 봉에서 손절가까지 닿았으면 손절로 본다(보수적).
+    be_r=k: 1H 봉 고(롱)/저(숏)가 진입가 + k×손절 거리(= +kR) 에 닿으면 다음 봉부터 손절을 진입가 + be_to×손절 거리 (0 = 본전 + BE_OFF)로 올린다.
+    narrow: 좁은 신호 봉 배수 (rls.narrow_k) 도 크기에 곱한다 (지금 운용 규칙).
+    chase=(mode, n, W): 손절(본전 손절 제외) 뒤 그 몫 경계의 최신 일봉 신호가 아직 같은 방향이면 재진입 (edge 대신). 최대 n 번 연속, W 시간 안.
+      mode "now" = 다음 시간 시가 즉시, "reclaim" = 1H 종가가 손절가를 다시 넘은(롱: 위로) 다음 시간 시가. 신호가 꺼지면 추격 취소.
+      (mode, n, W, opt) opt: k = 추격 진입 크기 배수, age = 재진입 신호의 레짐 나이 상한(일), adx = ADX14 하한, slope = 진입 방향 SMA50 기울기 상한(%)."""
     b = h.assign(t=pd.to_datetime(h.ts, unit="ms")).set_index("t")[["open", "high", "low", "close"]].astype(float)
     b = b[(b.index >= pd.Timestamp(start)) & (b.index <= pd.Timestamp(end))]
     S = signals(h) if S is None else S
-    mmr, cash, pos, blk, pend, lim = rls.SIM_MMR["coin"], 1.0, None, None, None, None
+    mmr, cash, pos, blk, pend, lim, ch = rls.SIM_MMR["coin"], 1.0, None, None, None, None, None
     stats = {"orders": 0, "filled": 0, "fallback": 0, "missed": 0}
     eqs, trades = {}, []
 
     def close(px, why, t):
-        nonlocal cash, pos, blk, pend
+        nonlocal cash, pos, blk, pend, ch
         p, pos, pend = pos, None, None
         fill = px * (1 - p["side"] * rls.SLIP)
         pnl = p["side"] * p["qty"] * (fill - p["entry"]) - rls.TAKER * p["qty"] * fill
         cash += pnl
         if rls.edge_after(why, p["be"]):
             blk = p["side"]
+        if chase and why == "sl" and not p["be"] and p.get("n", 0) < chase[1]:
+            ch = {"side": p["side"], "stop": px, "h0": p["h0"], "until": t + pd.Timedelta(hours=chase[2]), "n": p.get("n", 0) + 1, "ok": chase[0] == "now"}
         trades.append({"entry_ts": p["t0"], "exit_ts": t, "side": p["side"], "why": why, "pnl_pct": (pnl - p["fee"] + p["fund"]) / p["eq0"]})
 
+    opt = chase[3] if chase and len(chase) > 3 else {}
+
+    def ok_q(s2, side):                                                # 추격 품질 조건 (opt)
+        return (s2.age <= opt.get("age", 1e9) and s2.adx >= opt.get("adx", -1) and side * s2.slope <= opt.get("slope", 1e9))
+
+    n_ch = 0
     for t, r in b.iterrows():
         sig = S.loc[t] if t in S.index else None                       # 이 시각에 막 끝난 24h 봉 (경계 = t.hour)
         own = pos is not None and t.hour == pos["h0"] and sig is not None
@@ -47,6 +72,14 @@ def run(h, hours, start, end, L=30, margin=0.04, limit=None, S=None):
         if sig is not None and blk is not None and sig.conf != blk and t.hour in hours:
             blk = None
         go = None
+        if pos is None and ch is not None:                             # 손절 뒤 추격: 그 몫 경계 최신 일봉 신호가 같은 방향일 때만
+            tb = t.normalize() + pd.Timedelta(hours=ch["h0"])
+            tb = tb if tb <= t else tb - pd.Timedelta(days=1)
+            s2 = S.loc[tb] if tb in S.index else None
+            if t > ch["until"] or s2 is None or s2.conf != ch["side"]:
+                ch = None
+            elif ch["ok"] and not np.isnan(s2.atr) and rls.vol_ok(s2.atr, s2.close) and ok_q(s2, ch["side"]):
+                go = (ch["side"], s2, r.open * (1 + ch["side"] * rls.SLIP), rls.TAKER); n_ch = ch["n"]; ch = None; blk = None
         if pos is None and lim is not None:                           # 걸어 둔 지정가: 이 봉에서 닿으면 체결
             if (r.high >= lim["px"]) if lim["side"] < 0 else (r.low <= lim["px"]):
                 go = (lim["side"], lim["sig"], lim["px"], rls.MAKER if hasattr(rls, "MAKER") else 0.0002); stats["filled"] += 1; lim = None
@@ -67,12 +100,21 @@ def run(h, hours, start, end, L=30, margin=0.04, limit=None, S=None):
                 go = (int(sig.conf), sig, r.open * (1 + int(sig.conf) * rls.SLIP), rls.TAKER)
         if go:
             side, sig, fill, fee_rate = go; dist = rls.stop_dist(sig.atr, sig.close, L, mmr)
-            m = cash * margin * rls.vol_k(sig.atr, sig.close)
+            m = cash * margin * rls.vol_k(sig.atr, sig.close) * (rls.narrow_k(sig.w) if narrow else 1.0) * (opt.get("k", 1.0) if n_ch else 1.0)
             fee = fee_rate * m * L; cash -= fee
+            h0 = t.hour
+            if n_ch:                                                   # 추격 진입은 원래 몫 경계로 관리
+                h0 = sig.name.hour if hasattr(sig, "name") and sig.name is not None else t.hour
             pos = {"side": side, "entry": fill, "qty": m * L / fill, "stop": rls.stop_px(side, fill, dist), "atr_e": sig.atr,
-                   "be": False, "h0": t.hour, "t0": t, "fee": fee, "fund": 0.0, "eq0": cash + fee}
+                   "be": False, "h0": h0, "t0": t, "fee": fee, "fund": 0.0, "eq0": cash + fee, "dist": dist, "arm": False, "n": n_ch}
+            n_ch = 0
         if pos and (r.low <= pos["stop"] if pos["side"] > 0 else r.high >= pos["stop"]):
             close(min(r.open, pos["stop"]) if pos["side"] > 0 else max(r.open, pos["stop"]), "sl", t)
+        if pos and be_r and not pos["arm"] and t > pos["t0"] and \
+                ((r.high >= pos["entry"] * (1 + be_r * pos["dist"])) if pos["side"] > 0 else (r.low <= pos["entry"] * (1 - be_r * pos["dist"]))):
+            to = rls.be_px(pos["side"], pos["entry"]) if not be_to else pos["entry"] * (1 + pos["side"] * be_to * pos["dist"])
+            pos["stop"] = rls.tighten(pos["side"], pos["stop"], to)     # 이 봉 손절 판정 뒤에 올림 = 다음 봉부터 (같은 봉 고저 순서 모름)
+            pos["arm"] = True; pos["be"] = pos["be"] or not be_to       # 진입 봉 자체는 보지 않음 (진입 전 고저 섞임)
         if pos:
             f = -pos["side"] * rls.FUNDING_8H / 8 * pos["qty"] * r.close
             cash += f; pos["fund"] += f
@@ -83,6 +125,8 @@ def run(h, hours, start, end, L=30, margin=0.04, limit=None, S=None):
                     pend = "drop1"; blk = pos["side"]
                 elif not pos["be"] and rls.be_hit(pos["side"], s2.close, pos["entry"], pos["atr_e"]):
                     pos["stop"] = rls.tighten(pos["side"], pos["stop"], rls.be_px(pos["side"], pos["entry"])); pos["be"] = True
+        if ch is not None and not ch["ok"] and ch["side"] * (r.close - ch["stop"]) > 0:
+            ch["ok"] = True                                            # reclaim: 이 봉 종가가 손절가를 되찾음 → 다음 봉 시가 진입
         eqs[t] = cash + (pos["side"] * pos["qty"] * (r.close - pos["entry"]) if pos else 0.0)
     eq = pd.Series(eqs)
     run.stats = stats

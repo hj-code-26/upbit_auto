@@ -1,0 +1,257 @@
+{
+ "run": "bez3-l30-m4.0",
+ "period": "2026-01-20 ~ 2026-10-18",
+ "strategy": {
+  "insts": [
+   "BTC-USDT-SWAP",
+   "ETH-USDT-SWAP",
+   "ZEC-USDT-SWAP"
+  ],
+  "tranches_utc": [
+   0,
+   8,
+   16
+  ],
+  "lever": 30,
+  "margin_per_symbol": 0.04,
+  "margin_per_tranche": 0.013333333333333334,
+  "max_total_margin": 0.1,
+  "signal": {
+   "ver": "RLS-C3",
+   "sma": 50,
+   "slope": 20,
+   "conf": 3,
+   "atr": "wilder14",
+   "sl_atr": 1.5,
+   "liq_buf": 0.01,
+   "be_atr": 1.0,
+   "be_off": 0.0015,
+   "drop_atr": 1.0,
+   "edge_why": [
+    "sl",
+    "liq",
+    "drop1"
+   ],
+   "be_edge": false,
+   "atr_max": 0.08,
+   "adx_fill": 30,
+   "adx_conf": 3,
+   "vol_target": 0.04,
+   "vol_k": [
+    0.5,
+    2.0
+   ],
+   "narrow_w": 0.6,
+   "narrow_k": 0.5,
+   "bar": "4H confirmed -> 24h at tranche boundary"
+  },
+  "risk": {
+   "ver": "R2",
+   "kill_dd": 0.35,
+   "daily_loss": 0.05,
+   "daily_ref": "UTC 00:00 record",
+   "streak_hold": 20,
+   "streak_scope": "tranche",
+   "anomaly": 0.03,
+   "stop_trigger": "last"
+  },
+  "cost": {
+   "taker": 0.0005,
+   "slip_one_way": 0.0002,
+   "funding_8h": 0.0001,
+   "funding_model": "constant, sign by side"
+  }
+ },
+ "strategy_hash": "1125f721d7f8",
+ "kw": {},
+ "lever": 30,
+ "tranches_utc": [
+  0,
+  8,
+  16
+ ],
+ "stats": {
+  "cagr%": 182.60838481348122,
+  "mdd%": 12.149866506310792,
+  "sharpe": 2.3338311508988907,
+  "worst_wk%": -5.7077929907007,
+  "worst_mo%": -7.860574192795344,
+  "pos_mo%": 55.55555555555556,
+  "trades": 77.0,
+  "by": {
+   "coin": 77
+  },
+  "win": 38.961038961038966,
+  "pf": 3.848198186965596,
+  "liq": 0.0,
+  "streak": 14.0,
+  "loss_med": -1.5058599021976764,
+  "loss_min": -3.8373668224388466,
+  "ex_top10": -0.313476696489734,
+  "why": {
+   "sl": 49,
+   "daily_loss": 22,
+   "regime": 5,
+   "drop1": 1
+  },
+  "yearly%": {
+   "2026": 115.54
+  },
+  "longest_underwater_days": 119,
+  "current_underwater_days": 53
+ },
+ "trades_stats": {
+  "trades": 77,
+  "by_inst": {
+   "ETH-USDT-SWAP": 32,
+   "BTC-USDT-SWAP": 30,
+   "ZEC-USDT-SWAP": 15
+  },
+  "win%": 38.961038961038966,
+  "pf": 3.8481981869655972,
+  "net_pnl_acct": 1.1377438683239982,
+  "max_loss_streak": 14,
+  "why": {
+   "sl": 49,
+   "daily_loss": 22,
+   "regime": 5,
+   "drop1": 1
+  },
+  "cap_bound%": 100.0,
+  "be_moved%": 36.36363636363637,
+  "top1_share%": 19.021432434407178,
+  "top3_share%": 53.11057336642665,
+  "top5_share%": 77.84611558845044,
+  "top_abs": [
+   0.2164151811898599,
+   0.21303769678314713,
+   0.17480941393523064,
+   0.17330262863574455,
+   0.10812448629202483
+  ],
+  "by_year": {
+   "2026": 1.13774
+  },
+  "by_inst_pnl": {
+   "BTC-USDT-SWAP": 0.12949,
+   "ETH-USDT-SWAP": 0.43247,
+   "ZEC-USDT-SWAP": 0.57579
+  },
+  "by_side_pnl": {
+   "-1": 0.19582,
+   "1": 0.94193
+  },
+  "same_side_overlap_days%": 66.14583333333334,
+  "avg_hold_days": 4.597402597402597
+ },
+ "rolling_30d": {
+  "windows": 241,
+  "first_start": "2026-01-20",
+  "last_start": "2026-09-17",
+  "median%": 0.2541428617722774,
+  "p5%": -4.881394783534043,
+  "p25%": -2.15283344369136,
+  "p75%": 7.829987060305044,
+  "p95%": 81.13042397635277,
+  "min%": -9.589962740818125,
+  "max%": 89.68288631651302,
+  "loss_frac%": 47.30290456431535,
+  "mdd_in_window_med%": 5.5000873616338435,
+  "mdd_in_window_max%": 11.100970559027223,
+  "no_new_entry_frac%": 2.904564315352697,
+  "note": "겹치는 창 — 독립 표본이 아니다 (신뢰구간 계산 안 함)"
+ },
+ "rolling_90d": {
+  "windows": 181,
+  "first_start": "2026-01-20",
+  "last_start": "2026-07-19",
+  "median%": 6.15746189999109,
+  "p5%": -5.179577583493056,
+  "p25%": 1.8947591945340347,
+  "p75%": 72.56208036278949,
+  "p95%": 80.7341779648898,
+  "min%": -9.475709153405953,
+  "max%": 99.95339607872897,
+  "loss_frac%": 16.574585635359114,
+  "mdd_in_window_med%": 10.015061831748485,
+  "mdd_in_window_max%": 12.149866506310792,
+  "no_new_entry_frac%": 0.0,
+  "note": "겹치는 창 — 독립 표본이 아니다 (신뢰구간 계산 안 함)"
+ },
+ "stop_fill_1h": {
+  "sl_trades": 49,
+  "hourly_gap_through": 0,
+  "extra_loss_sum_pct_of_notional": 0.0,
+  "liq_reached_same_hour": 6
+ },
+ "exposure": {
+  "margin_per_symbol": 0.04,
+  "margin_per_tranche": 0.013333333333333334,
+  "notional_per_symbol_full": 1.2,
+  "notional_gross_full_2coins": 2.4,
+  "stop_cap": 0.018833333333333334,
+  "atr_over_px_cap_binds_above": 0.012555555555555556
+ },
+ "assumptions": [
+  "일봉 근사: 몫 경계 시각 시가 체결 (운용은 HH:02 시장가 — 2분 차이 미반영, 슬리피지 스트레스로 대신)",
+  "손절: 일봉 고저가 손절가를 넘으면 손절가 체결, 시가 갭이면 시가 (1H 갭은 stop_fill_1h 진단)",
+  "강제청산: last 가격 = mark 가정, 티어1 MMR 0.4% 고정 — 청산 안전성 검증 완료 아님",
+  "펀딩: 8시간 0.01% 고정 (과거 실제 펀딩 아님), 부호대로 지급/수취",
+  "몫마다 독립 자본·독립 일손실·독립 킬 (운용은 계좌 합산) — 3몫 결과는 일손실 발동을 과대 반영할 수 있음",
+  "20연패 진입 중단·강제청산 진입 중단·사람 재개는 리플레이에 없음",
+  "데이터: OKX 1H last 봉 (2020-01-01~), 누락 시간 없음 확인, 보간 없음"
+ ],
+ "data": {
+  "BTC-USDT-SWAP": {
+   "source": "OKX /market/history-candles 1H (last 가격), data_cache 캐시",
+   "tz": "UTC",
+   "first": "2020-01-01 00:00:00",
+   "last": "2026-10-16 00:00:00",
+   "rows": 59521,
+   "unconfirmed_rows": 0,
+   "gaps_over_1h": 0,
+   "sha256_16": "59bb61dd174d66f9",
+   "eval": [
+    "2026-01-20",
+    "2026-10-18"
+   ],
+   "warmup": "평가 시작 전 봉은 신호 계산에만 (SMA50+기울기20+CONF3 ≥ 73일, ATR14)"
+  },
+  "ETH-USDT-SWAP": {
+   "source": "OKX /market/history-candles 1H (last 가격), data_cache 캐시",
+   "tz": "UTC",
+   "first": "2020-01-01 00:00:00",
+   "last": "2026-10-18 09:00:00",
+   "rows": 59578,
+   "unconfirmed_rows": 0,
+   "gaps_over_1h": 0,
+   "sha256_16": "114b7369485928d1",
+   "eval": [
+    "2026-01-20",
+    "2026-10-18"
+   ],
+   "warmup": "평가 시작 전 봉은 신호 계산에만 (SMA50+기울기20+CONF3 ≥ 73일, ATR14)"
+  },
+  "ZEC-USDT-SWAP": {
+   "source": "OKX /market/history-candles 1H (last 가격), data_cache 캐시",
+   "tz": "UTC",
+   "first": "2025-11-06 03:00:00",
+   "last": "2026-10-19 00:00:00",
+   "rows": 8326,
+   "unconfirmed_rows": 0,
+   "gaps_over_1h": 0,
+   "sha256_16": "24e441faf4489ca0",
+   "eval": [
+    "2026-01-20",
+    "2026-10-18"
+   ],
+   "warmup": "평가 시작 전 봉은 신호 계산에만 (SMA50+기울기20+CONF3 ≥ 73일, ATR14)"
+  }
+ },
+ "code": {
+  "files_sha": "973c5e255a2d",
+  "git": "ad5db99",
+  "dirty": true
+ },
+ "experiment_note": "설정(10x→20x→30x, 4%→2%, 1몫→3몫, CONF3·BE1·DROP1)은 2020-04~2026-10 전 구간을 본 뒤 고름 (git: 4737945 10-06 10x, e981f63 10-09 20x DROP1, 작업 트리 10-11 30x 3몫). 2023-07-01 이후도 사후 검토된 구간이지 독립 검증이 아니다."
+}

@@ -1,0 +1,8 @@
+task,feature,rule_test
+box_hold,f_w,0.5594
+box_dir,d_box,0.8313
+hh,d_hi,0.7358
+ll,d_lo,0.7222
+hl_first,d_hl,0.7903
+expand,d_rng,0.6928
+up,f_r1,0.5116

@@ -38,8 +38,9 @@ def lever(d_stop):
     return int(min(L_CAP, np.floor(1 / (d_stop + MMR + rls.TAKER + BUF))))
 
 
-def run(d, start=None, end=None, levels_fn=levels, table=LEVELS):
-    """한 일봉 열 → (일별 자산, 거래). 시가 진입·청산, 장중 손절, 종가에 추적·본전·DROP1·정세 판정."""
+def run(d, start=None, end=None, levels_fn=levels, table=LEVELS, L_fix=None):
+    """한 일봉 열 → (일별 자산, 거래). 시가 진입·청산, 장중 손절, 종가에 추적·본전·DROP1·정세 판정.
+    L_fix: 레버리지 고정 (손절 거리를 그 청산 거리 − BUF 안으로 자름 = rls.stop_dist 와 같은 cap). None = 거래마다 맞춤."""
     x = d[["open", "high", "low", "close"]].astype(float).copy()
     x["lvl"], x["atr"], x["prev"] = levels_fn(d), rls.atr(x), x.close.shift()
     cash, pos, pend, cool, eqs, trades = 1.0, None, None, {}, {}, []
@@ -72,7 +73,9 @@ def run(d, start=None, end=None, levels_fn=levels, table=LEVELS):
             close(r.open, pend or "level", t)
         if not pos and lv["side"] and t >= cool.get(lv["side"], t) and not np.isnan(s.atr):
             dist = lv["stop"] * s.atr / s.close
-            L, eq0 = lever(dist), cash
+            if L_fix:
+                dist = min(dist, 1 / L_fix - MMR - rls.TAKER - BUF)
+            L, eq0 = L_fix or lever(dist), cash
             notional = min(lv["risk"] * eq0 / dist, lv.get("expo", EXPO_CAP) * eq0, MARGIN_CAP * eq0 * L)
             fill = r.open * (1 + lv["side"] * rls.SLIP)
             fee = rls.TAKER * notional
